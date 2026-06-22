@@ -5,12 +5,15 @@ import { prisma } from "@/lib/prisma";
 import { getNormalizedFinancials } from "@/lib/listing-data";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Textarea, Badge } from "@/components/ui/misc";
+import { Input } from "@/components/ui/input";
+import { Textarea, Badge, Select } from "@/components/ui/misc";
 import { StatusBadge } from "@/components/status-badge";
 import { FinancialSchedule } from "@/components/financial-schedule";
+import { ListingImage } from "@/components/listing-image";
 import { verifyListing, rejectListing, decideUnlock } from "@/app/admin/actions";
+import { adminUploadListingImage } from "@/app/admin/listings/actions";
 import { formatCurrency } from "@/lib/utils";
-import { FileText } from "lucide-react";
+import { FileText, Plus } from "lucide-react";
 
 export default async function AdminDashboard() {
   const session = await auth();
@@ -36,9 +39,14 @@ export default async function AdminDashboard() {
 
   return (
     <div className="space-y-10">
-      <div>
-        <h1 className="text-2xl font-bold tracking-tight">Admin dashboard</h1>
-        <p className="text-muted-foreground">Verification queue, listings, users and unlock requests.</p>
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-bold tracking-tight">Admin dashboard</h1>
+          <p className="text-muted-foreground">Verification queue, listings, users and unlock requests.</p>
+        </div>
+        <Link href="/admin/listings/new">
+          <Button className="gap-2"><Plus className="size-4" /> Add listing</Button>
+        </Link>
       </div>
 
       {/* Verification queue */}
@@ -155,8 +163,22 @@ export default async function AdminDashboard() {
               </thead>
               <tbody>
                 {allListings.map((l) => (
-                  <tr key={l.id} className="border-b last:border-0">
-                    <td className="py-2 pr-4"><Link href={`/listings/${l.id}`} className="text-primary hover:underline">{l.title}</Link></td>
+                  <tr key={l.id} className="border-b last:border-0 align-middle">
+                    <td className="py-2 pr-4">
+                      <div className="flex items-center gap-3">
+                        <div className="relative h-10 w-16 overflow-hidden rounded flex-shrink-0">
+                          <ListingImage imageUrl={l.imageUrl} title={l.title} className="h-full" />
+                        </div>
+                        <div>
+                          <Link href={`/listings/${l.id}`} className="text-primary hover:underline font-medium">{l.title}</Link>
+                          <form action={adminUploadListingImage} className="mt-1 flex items-center gap-1">
+                            <input type="hidden" name="listingId" value={l.id} />
+                            <Input type="file" name="file" accept="image/*" className="h-7 text-xs w-36 py-1" />
+                            <Button type="submit" size="sm" variant="outline" className="h-7 text-xs px-2">Upload image</Button>
+                          </form>
+                        </div>
+                      </div>
+                    </td>
                     <td className="py-2 pr-4">{l.industry}</td>
                     <td className="py-2 pr-4">{l.seller.name}</td>
                     <td className="py-2 pr-4">{formatCurrency(l.askingPrice)}</td>

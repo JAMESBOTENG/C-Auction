@@ -4,39 +4,48 @@
 
 @layer base {
   :root {
-    --background: 0 0% 100%;
-    --foreground: 222 47% 11%;
+    --background: 210 20% 98%;
+    --foreground: 220 40% 10%;
     --card: 0 0% 100%;
-    --card-foreground: 222 47% 11%;
-    --primary: 222 47% 11%;
+    --card-foreground: 220 40% 10%;
+    --primary: 220 60% 18%;
     --primary-foreground: 210 40% 98%;
-    --secondary: 210 40% 96%;
-    --secondary-foreground: 222 47% 11%;
-    --muted: 210 40% 96%;
-    --muted-foreground: 215 16% 47%;
-    --accent: 210 40% 96%;
-    --accent-foreground: 222 47% 11%;
+    --secondary: 214 32% 93%;
+    --secondary-foreground: 220 40% 20%;
+    --muted: 214 28% 94%;
+    --muted-foreground: 215 18% 48%;
+    --accent: 27 96% 52%;
+    --accent-foreground: 0 0% 100%;
     --destructive: 0 72% 51%;
     --destructive-foreground: 210 40% 98%;
-    --success: 142 71% 35%;
+    --success: 142 64% 30%;
     --success-foreground: 0 0% 100%;
-    --border: 214 32% 91%;
-    --input: 214 32% 91%;
-    --ring: 222 47% 11%;
-    --radius: 0.5rem;
+    --border: 214 28% 88%;
+    --input: 214 28% 88%;
+    --ring: 220 60% 18%;
+    --radius: 0.625rem;
   }
 }
 
 @layer base {
-  * {
-    @apply border-border;
-  }
+  * { @apply border-border; }
   body {
     @apply bg-background text-foreground antialiased;
-    font-feature-settings: "rlig" 1, "calt" 1, "tnum" 1;
+    font-feature-settings: "rlig" 1, "calt" 1;
   }
+  h1, h2, h3, h4 { @apply tracking-tight; }
 }
 
-.tabular {
-  font-variant-numeric: tabular-nums;
+.tabular { font-variant-numeric: tabular-nums; }
+
+/* Card hover lift */
+.card-hover {
+  @apply transition-all duration-200 hover:shadow-lg hover:-translate-y-0.5;
 }
+
+/* Metric label/value pairs */
+.metric-label { @apply text-xs font-medium uppercase tracking-wide text-muted-foreground; }
+.metric-value { @apply text-xl font-bold tabular; }
+
+/* Subtle section divider */
+.section-rule { @apply border-t border-border; }

@@ -22,6 +22,7 @@ interface ListingSeed {
   employees: number;
   reasonForSale: string;
   askingPrice: number;
+  imageUrl?: string;
   years: YearData[];
 }
 
@@ -30,6 +31,7 @@ const listings: ListingSeed[] = [
     title: "Established Residential HVAC Contractor",
     industry: "Residential HVAC",
     state: "TX",
+    imageUrl: "https://d8j0ntlcm91z4.cloudfront.net/user_3F2LiUiOM9g7M1923tO7lOsFeNl/hf_20260622_143523_57430ab8-9b5f-457d-8663-fd9a813b1992.png",
     yearFounded: 1998,
     employees: 14,
     reasonForSale: "Owner retiring after 25+ years; no family successor.",
@@ -80,6 +82,7 @@ const listings: ListingSeed[] = [
     title: "Medicare-Certified Home-Health Agency",
     industry: "Home-Health Agency",
     state: "FL",
+    imageUrl: "https://d8j0ntlcm91z4.cloudfront.net/user_3F2LiUiOM9g7M1923tO7lOsFeNl/hf_20260622_143524_f584e1ff-151b-4886-9d8a-4e697f92cf2f.png",
     yearFounded: 2006,
     employees: 42,
     reasonForSale: "Founder relocating to care for family; seeking operator buyer.",
@@ -423,6 +426,7 @@ async function main() {
         askingPrice: l.askingPrice,
         status: "VERIFIED",
         isVerified: true,
+        imageUrl: l.imageUrl ?? null,
         financials: {
           create: l.years.map((y) => ({
             year: y.year,

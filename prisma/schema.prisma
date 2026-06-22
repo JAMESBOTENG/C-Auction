@@ -59,6 +59,7 @@ model Listing {
   status       ListingStatus @default(DRAFT)
   isVerified   Boolean       @default(false)
   reviewNotes  String?
+  imageUrl     String?
   createdAt    DateTime      @default(now())
 
   financials     Financials[]
