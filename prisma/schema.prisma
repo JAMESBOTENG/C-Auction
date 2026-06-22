@@ -1,0 +1,130 @@
+// Prisma schema for Succession.
+// SQLite for local dev. To swap to Postgres later, change provider to "postgresql"
+// and the DATABASE_URL. JSON columns use String here (SQLite has no native Json);
+// the app serializes/deserializes via lib/json helpers so the move to Postgres is trivial.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  BUYER
+  SELLER
+  ADMIN
+}
+
+enum ListingStatus {
+  DRAFT
+  PENDING_REVIEW
+  VERIFIED
+  REJECTED
+}
+
+enum UnlockStatus {
+  PENDING
+  APPROVED
+  DENIED
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  role         Role     @default(BUYER)
+  name         String
+  createdAt    DateTime @default(now())
+
+  listings       Listing[]
+  unlockRequests UnlockRequest[]
+  messages       Message[]
+  documents      Document[]
+}
+
+model Listing {
+  id           String        @id @default(cuid())
+  sellerId     String
+  seller       User          @relation(fields: [sellerId], references: [id])
+  title        String
+  industry     String
+  state        String
+  yearFounded  Int
+  employees    Int
+  reasonForSale String
+  askingPrice  Float
+  status       ListingStatus @default(DRAFT)
+  isVerified   Boolean       @default(false)
+  reviewNotes  String?
+  createdAt    DateTime      @default(now())
+
+  financials     Financials[]
+  addBacks       AddBack[]
+  documents      Document[]
+  unlockRequests UnlockRequest[]
+  messages       Message[]
+}
+
+model Financials {
+  id                String  @id @default(cuid())
+  listingId         String
+  listing           Listing @relation(fields: [listingId], references: [id], onDelete: Cascade)
+  year              Int
+  revenue           Float
+  cogs              Float
+  operatingExpenses String  // JSON: { [label]: amount }
+  ownerSalary       Float
+
+  @@unique([listingId, year])
+}
+
+model AddBack {
+  id        String  @id @default(cuid())
+  listingId String
+  listing   Listing @relation(fields: [listingId], references: [id], onDelete: Cascade)
+  year      Int
+  label     String
+  amount    Float
+  category  String  // one of the AddBackCategory enum values (validated in app)
+  note      String?
+}
+
+model Document {
+  id         String   @id @default(cuid())
+  listingId  String
+  listing    Listing  @relation(fields: [listingId], references: [id], onDelete: Cascade)
+  filename   String
+  path       String
+  kind       String   // e.g. TAX_RETURN, PNL, OTHER
+  uploadedBy String
+  uploader   User     @relation(fields: [uploadedBy], references: [id])
+  createdAt  DateTime @default(now())
+}
+
+model UnlockRequest {
+  id                 String       @id @default(cuid())
+  listingId          String
+  listing            Listing      @relation(fields: [listingId], references: [id], onDelete: Cascade)
+  buyerId            String
+  buyer              User         @relation(fields: [buyerId], references: [id])
+  ndaAcceptedAt      DateTime
+  proofOfFundsAmount Float
+  proofOfFundsSource String
+  status             UnlockStatus @default(PENDING)
+  createdAt          DateTime     @default(now())
+
+  @@unique([listingId, buyerId])
+}
+
+model Message {
+  id         String   @id @default(cuid())
+  listingId  String
+  listing    Listing  @relation(fields: [listingId], references: [id], onDelete: Cascade)
+  fromUserId String
+  fromUser   User     @relation(fields: [fromUserId], references: [id])
+  body       String
+  createdAt  DateTime @default(now())
+}
