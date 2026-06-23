@@ -2,20 +2,18 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { adminCreateListing } from "@/app/admin/listings/actions";
+import { adminCreateListing, adminUploadListingImage } from "@/app/admin/listings/actions";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label, Select, Textarea } from "@/components/ui/misc";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { ListingImage } from "@/components/listing-image";
 import { ADD_BACK_CATEGORIES } from "@/lib/financials";
-import { Trash2, Plus, ChevronDown, ChevronUp } from "lucide-react";
+import { Trash2, Plus, ImageIcon, Building2, BarChart3, Layers, UploadCloud } from "lucide-react";
 
 const CURRENT_YEAR = new Date().getFullYear();
 
 interface OpexLine { label: string; amount: string }
-interface YearForm {
-  year: string; revenue: string; cogs: string; ownerSalary: string; opex: OpexLine[];
-}
+interface YearForm { year: string; revenue: string; cogs: string; ownerSalary: string; opex: OpexLine[] }
 interface AddBackForm { year: string; label: string; amount: string; category: string; note: string }
 
 function emptyYear(y: number): YearForm {
@@ -28,12 +26,13 @@ export function AdminListingForm() {
   const router = useRouter();
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
-  const [openSection, setOpenSection] = useState<"profile" | "financials" | "addbacks">("profile");
 
   const [profile, setProfile] = useState({
     title: "", industry: "", state: "TX", yearFounded: "2005", employees: "",
     reasonForSale: "", askingPrice: "", publishNow: true, imageUrl: "",
   });
+  const [imageFile, setImageFile] = useState<File | null>(null);
+  const [filePreview, setFilePreview] = useState<string | null>(null);
   const [years, setYears] = useState<YearForm[]>([
     emptyYear(CURRENT_YEAR - 2), emptyYear(CURRENT_YEAR - 1), emptyYear(CURRENT_YEAR),
   ]);
@@ -49,13 +48,17 @@ export function AdminListingForm() {
   function updateAB(i: number, patch: Partial<AddBackForm>) {
     setAddBacks((xs) => xs.map((x, j) => (j === i ? { ...x, ...patch } : x)));
   }
+  function onPickFile(f: File | null) {
+    setImageFile(f);
+    setFilePreview((prev) => { if (prev) URL.revokeObjectURL(prev); return f ? URL.createObjectURL(f) : null; });
+  }
 
   async function submit() {
     setError(null); setSubmitting(true);
     const res = await adminCreateListing({
       ...profile,
       publishNow: profile.publishNow,
-      imageUrl: profile.imageUrl || null,
+      imageUrl: profile.imageUrl.trim() || null,
       years: years.map((y) => ({
         year: Number(y.year), revenue: Number(y.revenue), cogs: Number(y.cogs),
         ownerSalary: Number(y.ownerSalary),
@@ -68,31 +71,26 @@ export function AdminListingForm() {
         category: a.category, note: a.note,
       })),
     });
-    setSubmitting(false);
-    if (res.ok) router.push(`/listings/${res.id}`);
-    else setError(res.error);
+
+    if (!res.ok) { setSubmitting(false); setError(res.error); return; }
+
+    // If a photo file was chosen, upload it to the freshly created listing.
+    if (imageFile) {
+      const fd = new FormData();
+      fd.append("listingId", res.id);
+      fd.append("file", imageFile);
+      try { await adminUploadListingImage(fd); } catch { /* non-fatal */ }
+    }
+    router.push(`/listings/${res.id}`);
   }
 
-  const Section = ({ id, title, children }: { id: typeof openSection; title: string; children: React.ReactNode }) => (
-    <Card className="shadow-card">
-      <button
-        type="button"
-        className="flex w-full items-center justify-between p-6 text-left"
-        onClick={() => setOpenSection(openSection === id ? id : id)}
-      >
-        <CardTitle>{title}</CardTitle>
-        {openSection === id ? <ChevronUp className="size-4 text-muted-foreground" /> : <ChevronDown className="size-4 text-muted-foreground" />}
-      </button>
-      {openSection === id && <CardContent className="pt-0">{children}</CardContent>}
-    </Card>
-  );
+  const previewSrc = filePreview || (profile.imageUrl.trim() || null);
 
   return (
-    <div className="space-y-4">
-      {/* Business Profile */}
-      <Card className="shadow-card" onClick={() => setOpenSection("profile")}>
-        <CardHeader><CardTitle>1. Business profile</CardTitle></CardHeader>
-        <CardContent className="grid gap-4 sm:grid-cols-2">
+    <div className="space-y-5">
+      {/* 1. Business profile */}
+      <FormCard step={1} icon={Building2} title="Business profile" subtitle="The headline details buyers see first.">
+        <div className="grid gap-4 sm:grid-cols-2">
           <F label="Listing title" className="sm:col-span-2">
             <Input value={profile.title} onChange={(e) => setProfile({ ...profile, title: e.target.value })} placeholder="e.g. Established Residential HVAC Contractor" />
           </F>
@@ -110,37 +108,61 @@ export function AdminListingForm() {
           <F label="Employees">
             <Input type="number" value={profile.employees} onChange={(e) => setProfile({ ...profile, employees: e.target.value })} />
           </F>
-          <F label="Asking price (USD)">
+          <F label="Asking price (USD)" className="sm:col-span-2">
             <Input type="number" value={profile.askingPrice} onChange={(e) => setProfile({ ...profile, askingPrice: e.target.value })} placeholder="1500000" />
-          </F>
-          <F label="Image URL (optional)" className="sm:col-span-2">
-            <Input value={profile.imageUrl} onChange={(e) => setProfile({ ...profile, imageUrl: e.target.value })} placeholder="https://… or leave blank for auto placeholder" />
           </F>
           <F label="Reason for sale" className="sm:col-span-2">
             <Textarea value={profile.reasonForSale} onChange={(e) => setProfile({ ...profile, reasonForSale: e.target.value })} placeholder="Owner retiring after 25 years; no family successor." />
           </F>
-          <div className="sm:col-span-2 flex items-center gap-2">
-            <input type="checkbox" id="publishNow" checked={profile.publishNow} onChange={(e) => setProfile({ ...profile, publishNow: e.target.checked })} className="h-4 w-4" />
-            <label htmlFor="publishNow" className="text-sm font-medium">Publish immediately as Verified (skip review workflow)</label>
-          </div>
-        </CardContent>
-      </Card>
+        </div>
+      </FormCard>
 
-      {/* Financials */}
-      <Card className="shadow-card">
-        <CardHeader><CardTitle>2. Financials (3 years)</CardTitle></CardHeader>
-        <CardContent className="space-y-6">
+      {/* 2. Photo */}
+      <FormCard step={2} icon={ImageIcon} title="Business photo" subtitle="Upload a photo, or paste an image URL. Skip it for an auto-designed cover.">
+        <div className="grid gap-5 sm:grid-cols-[200px_1fr]">
+          {/* Live preview */}
+          <div className="overflow-hidden rounded-xl border border-border/70 bg-muted">
+            {previewSrc ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img src={previewSrc} alt="preview" className="h-32 w-full object-cover" />
+            ) : (
+              <ListingImage title={profile.title || "Your business"} industry={profile.industry} className="h-32" />
+            )}
+          </div>
+          <div className="space-y-3">
+            <label className="flex cursor-pointer items-center justify-center gap-2 rounded-xl border-2 border-dashed border-border bg-secondary/40 px-4 py-4 text-sm font-medium text-muted-foreground transition-colors hover:border-primary/50 hover:text-primary">
+              <UploadCloud className="size-5" />
+              {imageFile ? imageFile.name : "Click to upload a photo"}
+              <input type="file" accept="image/*" className="hidden" onChange={(e) => onPickFile(e.target.files?.[0] ?? null)} />
+            </label>
+            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              <span className="h-px flex-1 bg-border" /> or paste a URL <span className="h-px flex-1 bg-border" />
+            </div>
+            <Input
+              value={profile.imageUrl}
+              onChange={(e) => setProfile({ ...profile, imageUrl: e.target.value })}
+              placeholder="https://images.example.com/photo.jpg"
+            />
+          </div>
+        </div>
+      </FormCard>
+
+      {/* 3. Financials */}
+      <FormCard step={3} icon={BarChart3} title="Financial data — 3 years" subtitle="Revenue, COGS, owner salary and itemized operating expenses per year.">
+        <div className="space-y-5">
           {years.map((y, i) => (
-            <div key={i} className="space-y-4 rounded-lg border p-4">
-              <h4 className="font-semibold text-sm text-muted-foreground uppercase tracking-wide">Year {i + 1}</h4>
+            <div key={i} className="rounded-xl border border-border/70 bg-secondary/30 p-4">
+              <div className="mb-3 inline-flex items-center gap-2 rounded-full bg-primary/10 px-3 py-1 text-xs font-bold uppercase tracking-wider text-primary">
+                Year {i + 1}
+              </div>
               <div className="grid gap-3 sm:grid-cols-4">
                 <F label="Calendar year"><Input type="number" value={y.year} onChange={(e) => updateYear(i, { year: e.target.value })} /></F>
                 <F label="Revenue ($)"><Input type="number" value={y.revenue} onChange={(e) => updateYear(i, { revenue: e.target.value })} placeholder="0" /></F>
                 <F label="COGS ($)"><Input type="number" value={y.cogs} onChange={(e) => updateYear(i, { cogs: e.target.value })} placeholder="0" /></F>
                 <F label="Owner salary ($)"><Input type="number" value={y.ownerSalary} onChange={(e) => updateYear(i, { ownerSalary: e.target.value })} placeholder="0" /></F>
               </div>
-              <div className="space-y-2">
-                <Label className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Operating expense line items</Label>
+              <div className="mt-3 space-y-2">
+                <Label className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Operating expense line items</Label>
                 {y.opex.map((o, oi) => (
                   <div key={oi} className="flex gap-2">
                     <Input className="flex-1" placeholder="Label (e.g. Payroll)" value={o.label} onChange={(e) => updateOpex(i, oi, { label: e.target.value })} />
@@ -156,25 +178,29 @@ export function AdminListingForm() {
               </div>
             </div>
           ))}
-        </CardContent>
-      </Card>
+        </div>
+      </FormCard>
 
-      {/* Add-backs */}
-      <Card className="shadow-card">
-        <CardHeader>
-          <div className="flex items-center justify-between">
-            <CardTitle>3. Add-backs</CardTitle>
-            <Button type="button" variant="outline" size="sm" onClick={() => setAddBacks((xs) => [...xs, { year: years[years.length - 1].year, label: "", amount: "", category: "OWNER_COMP", note: "" }])}>
-              <Plus className="size-4" /> Add row
-            </Button>
-          </div>
-        </CardHeader>
-        <CardContent className="space-y-3">
+      {/* 4. Add-backs */}
+      <FormCard
+        step={4}
+        icon={Layers}
+        title="Add-backs"
+        subtitle="Discretionary, one-time, non-cash, interest, tax and depreciation items."
+        action={
+          <Button type="button" variant="outline" size="sm" onClick={() => setAddBacks((xs) => [...xs, { year: years[years.length - 1].year, label: "", amount: "", category: "OWNER_COMP", note: "" }])}>
+            <Plus className="size-4" /> Add row
+          </Button>
+        }
+      >
+        <div className="space-y-3">
           {addBacks.length === 0 && (
-            <p className="text-sm text-muted-foreground">No add-backs yet. Add discretionary, one-time, non-cash, interest, tax, or depreciation items.</p>
+            <p className="rounded-lg border border-dashed border-border bg-secondary/30 px-4 py-6 text-center text-sm text-muted-foreground">
+              No add-backs yet. These increase SDE — add owner comp, personal expenses, one-time costs, interest, tax or D&amp;A.
+            </p>
           )}
           {addBacks.map((a, i) => (
-            <div key={i} className="grid items-end gap-2 rounded-lg border p-3 sm:grid-cols-12">
+            <div key={i} className="grid items-end gap-2 rounded-xl border border-border/70 bg-secondary/30 p-3 sm:grid-cols-12">
               <div className="space-y-1 sm:col-span-2"><Label className="text-xs">Year</Label>
                 <Select value={a.year} onChange={(e) => updateAB(i, { year: e.target.value })}>
                   {years.map((y) => <option key={y.year} value={y.year}>{y.year}</option>)}
@@ -194,29 +220,59 @@ export function AdminListingForm() {
               <div className="space-y-1 sm:col-span-2"><Label className="text-xs">Note</Label>
                 <Input placeholder="Optional" value={a.note} onChange={(e) => updateAB(i, { note: e.target.value })} />
               </div>
-              <div className="sm:col-span-1 flex items-end">
+              <div className="flex items-end sm:col-span-1">
                 <Button type="button" variant="ghost" size="icon" onClick={() => setAddBacks((xs) => xs.filter((_, j) => j !== i))}>
                   <Trash2 className="size-4" />
                 </Button>
               </div>
             </div>
           ))}
-        </CardContent>
-      </Card>
+        </div>
+      </FormCard>
 
       {error && (
-        <div className="rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">{error}</div>
+        <div className="rounded-xl border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm font-medium text-destructive">{error}</div>
       )}
 
-      <div className="flex items-center justify-between rounded-xl border bg-card p-5 shadow-card">
-        <p className="text-sm text-muted-foreground">
-          {profile.publishNow ? "Will be published as Verified immediately." : "Will be saved as Draft for review."}
-        </p>
+      {/* Sticky action bar */}
+      <div className="sticky bottom-4 z-10 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-border/70 bg-card/90 p-4 shadow-elevated backdrop-blur">
+        <label className="flex cursor-pointer items-center gap-2 text-sm font-medium">
+          <input type="checkbox" checked={profile.publishNow} onChange={(e) => setProfile({ ...profile, publishNow: e.target.checked })} className="h-4 w-4 accent-[var(--tw-accent,#6d4dfc)]" style={{ accentColor: "#6d4dfc" }} />
+          Publish immediately as Verified
+          <span className="text-muted-foreground">({profile.publishNow ? "live now" : "saved as draft"})</span>
+        </label>
         <Button onClick={submit} disabled={submitting} size="lg">
           {submitting ? "Creating…" : "Create listing"}
         </Button>
       </div>
     </div>
+  );
+}
+
+function FormCard({
+  step, icon: Icon, title, subtitle, action, children,
+}: {
+  step: number; icon: React.ComponentType<{ className?: string }>; title: string; subtitle: string;
+  action?: React.ReactNode; children: React.ReactNode;
+}) {
+  return (
+    <section className="rounded-2xl border border-border/70 bg-card p-6 shadow-card">
+      <div className="mb-5 flex items-start justify-between gap-3">
+        <div className="flex items-start gap-3">
+          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-brand-violet to-brand-fuchsia text-white shadow-glow">
+            <Icon className="size-5" />
+          </div>
+          <div>
+            <h2 className="font-display text-lg font-bold leading-tight">
+              <span className="text-muted-foreground">{step}.</span> {title}
+            </h2>
+            <p className="text-sm text-muted-foreground">{subtitle}</p>
+          </div>
+        </div>
+        {action}
+      </div>
+      {children}
+    </section>
   );
 }
 

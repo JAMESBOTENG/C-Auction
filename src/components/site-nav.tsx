@@ -1,49 +1,49 @@
 import Link from "next/link";
 import { auth, signOut } from "@/lib/auth";
 import { Button } from "@/components/ui/button";
-import { Building2 } from "lucide-react";
+import { ShieldCheck } from "lucide-react";
 
 export async function SiteNav() {
   const session = await auth();
   const role = session?.user?.role;
 
   return (
-    <header className="sticky top-0 z-40 border-b bg-card/90 backdrop-blur-sm shadow-card">
-      <div className="container flex h-15 items-center justify-between py-3">
-        <Link href="/" className="flex items-center gap-2.5 text-primary">
-          <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary">
-            <Building2 className="size-4 text-primary-foreground" />
+    <header className="sticky top-0 z-40 border-b border-border/60 glass">
+      <div className="container flex h-16 items-center justify-between">
+        <Link href="/" className="group flex items-center gap-2.5">
+          <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-gradient-to-br from-brand-violet via-brand-purple to-brand-fuchsia text-white shadow-glow transition-transform group-hover:scale-105">
+            <ShieldCheck className="size-5" />
           </div>
-          <span className="text-base font-bold tracking-tight">Chronos</span>
+          <span className="font-display text-lg font-extrabold tracking-tight">Chronos</span>
         </Link>
 
-        <nav className="flex items-center gap-0.5">
+        <nav className="flex items-center gap-1">
           <Link href="/listings">
-            <Button variant="ghost" size="sm" className="text-sm font-medium">Browse</Button>
+            <Button variant="ghost" size="sm" className="font-medium">Browse</Button>
           </Link>
           {role === "SELLER" && (
             <Link href="/seller">
-              <Button variant="ghost" size="sm" className="text-sm font-medium">My Listings</Button>
+              <Button variant="ghost" size="sm" className="font-medium">My Listings</Button>
             </Link>
           )}
           {role === "BUYER" && (
             <Link href="/buyer">
-              <Button variant="ghost" size="sm" className="text-sm font-medium">My Deals</Button>
+              <Button variant="ghost" size="sm" className="font-medium">My Deals</Button>
             </Link>
           )}
           {role === "ADMIN" && (
             <Link href="/admin">
-              <Button variant="ghost" size="sm" className="text-sm font-medium">Admin</Button>
+              <Button variant="ghost" size="sm" className="font-medium">Admin</Button>
             </Link>
           )}
 
-          <div className="ml-2 h-5 w-px bg-border" />
+          <div className="mx-2 h-5 w-px bg-border" />
 
           {session?.user ? (
-            <div className="ml-2 flex items-center gap-2">
+            <div className="flex items-center gap-3">
               <div className="hidden text-right sm:block">
                 <div className="text-xs font-semibold leading-none">{session.user.name}</div>
-                <div className="text-xs text-muted-foreground">{role}</div>
+                <div className="text-[11px] font-medium uppercase tracking-wide text-primary/70">{role}</div>
               </div>
               <form
                 action={async () => {
@@ -51,13 +51,13 @@ export async function SiteNav() {
                   await signOut({ redirectTo: "/" });
                 }}
               >
-                <Button variant="outline" size="sm" type="submit" className="text-xs">Sign out</Button>
+                <Button variant="outline" size="sm" type="submit">Sign out</Button>
               </form>
             </div>
           ) : (
-            <div className="ml-2 flex items-center gap-2">
+            <div className="flex items-center gap-2">
               <Link href="/login">
-                <Button size="sm" className="text-xs">Sign in</Button>
+                <Button size="sm">Sign in</Button>
               </Link>
             </div>
           )}

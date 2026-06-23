@@ -41,17 +41,27 @@ export default async function AdminDashboard() {
     <div className="space-y-10">
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-bold tracking-tight">Admin dashboard</h1>
-          <p className="text-muted-foreground">Verification queue, listings, users and unlock requests.</p>
+          <h1 className="font-display text-4xl font-extrabold tracking-tight">
+            Admin <span className="text-gradient">dashboard</span>
+          </h1>
+          <p className="mt-1 text-muted-foreground">Verification queue, listings, users and unlock requests.</p>
         </div>
         <Link href="/admin/listings/new">
-          <Button className="gap-2"><Plus className="size-4" /> Add listing</Button>
+          <Button size="lg" className="gap-2"><Plus className="size-4" /> Add a business</Button>
         </Link>
+      </div>
+
+      {/* Summary stats */}
+      <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+        <AdminStat label="Awaiting review" value={queue.length} grad="from-amber-500 to-orange-500" />
+        <AdminStat label="Pending unlocks" value={pendingUnlocks.length} grad="from-brand-cyan to-brand-indigo" />
+        <AdminStat label="Total listings" value={allListings.length} grad="from-brand-violet to-brand-fuchsia" />
+        <AdminStat label="Users" value={users.length} grad="from-emerald-500 to-teal-500" />
       </div>
 
       {/* Verification queue */}
       <section className="space-y-4">
-        <h2 className="text-lg font-semibold">Verification queue ({queue.length})</h2>
+        <h2 className="font-display text-xl font-bold">Verification queue ({queue.length})</h2>
         {queue.length === 0 && <p className="text-sm text-muted-foreground">Nothing awaiting review.</p>}
         {queue.map((l, i) => (
           <Card key={l.id}>
@@ -99,7 +109,7 @@ export default async function AdminDashboard() {
 
       {/* Unlock requests */}
       <section className="space-y-4">
-        <h2 className="text-lg font-semibold">Unlock requests — pending ({pendingUnlocks.length})</h2>
+        <h2 className="font-display text-xl font-bold">Unlock requests — pending ({pendingUnlocks.length})</h2>
         <Card>
           <CardContent className="pt-6">
             <table className="w-full text-sm">
@@ -148,7 +158,7 @@ export default async function AdminDashboard() {
 
       {/* All listings */}
       <section className="space-y-4">
-        <h2 className="text-lg font-semibold">All listings ({allListings.length})</h2>
+        <h2 className="font-display text-xl font-bold">All listings ({allListings.length})</h2>
         <Card>
           <CardContent className="pt-6">
             <table className="w-full text-sm">
@@ -167,7 +177,7 @@ export default async function AdminDashboard() {
                     <td className="py-2 pr-4">
                       <div className="flex items-center gap-3">
                         <div className="relative h-10 w-16 overflow-hidden rounded flex-shrink-0">
-                          <ListingImage imageUrl={l.imageUrl} title={l.title} className="h-full" />
+                          <ListingImage imageUrl={l.imageUrl} title={l.title} industry={l.industry} compact className="h-full" />
                         </div>
                         <div>
                           <Link href={`/listings/${l.id}`} className="text-primary hover:underline font-medium">{l.title}</Link>
@@ -193,7 +203,7 @@ export default async function AdminDashboard() {
 
       {/* All users */}
       <section className="space-y-4">
-        <h2 className="text-lg font-semibold">Users ({users.length})</h2>
+        <h2 className="font-display text-xl font-bold">Users ({users.length})</h2>
         <Card>
           <CardContent className="pt-6">
             <table className="w-full text-sm">
@@ -217,6 +227,16 @@ export default async function AdminDashboard() {
           </CardContent>
         </Card>
       </section>
+    </div>
+  );
+}
+
+function AdminStat({ label, value, grad }: { label: string; value: number; grad: string }) {
+  return (
+    <div className="rounded-2xl border border-border/70 bg-card p-5 shadow-card">
+      <div className={`mb-2 h-1.5 w-10 rounded-full bg-gradient-to-r ${grad}`} />
+      <div className="font-display text-3xl font-extrabold tabular">{value}</div>
+      <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">{label}</div>
     </div>
   );
 }

@@ -9,3 +9,6 @@ uploads/*
 !uploads/.gitkeep
 .DS_Store
 *.log
+
+# TS incremental build info
+tsconfig.tsbuildinfo
