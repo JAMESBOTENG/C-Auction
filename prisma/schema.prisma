@@ -1,4 +1,4 @@
-// Prisma schema for Succession.
+// Prisma schema for Chronos.
 // SQLite for local dev. To swap to Postgres later, change provider to "postgresql"
 // and the DATABASE_URL. JSON columns use String here (SQLite has no native Json);
 // the app serializes/deserializes via lib/json helpers so the move to Postgres is trivial.

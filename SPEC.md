@@ -1,4 +1,4 @@
-# SPEC — "Succession": a verified-financials marketplace for SMB acquisitions
+# SPEC — "Chronos": a verified-financials marketplace for SMB acquisitions
 
 ## Context
 A web marketplace for buying/selling small, owner-operated US businesses whose founders are

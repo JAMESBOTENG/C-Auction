@@ -3,7 +3,7 @@ import "./globals.css";
 import { SiteNav } from "@/components/site-nav";
 
 export const metadata: Metadata = {
-  title: "Succession — Verified-Financials Business Marketplace",
+  title: "Chronos — Verified-Financials Business Marketplace",
   description:
     "Acquisition marketplace for retiring owner-operators. Every listing's financials are normalized into a defensible SDE & EBITDA with an itemized, auditable add-back schedule.",
 };
@@ -24,7 +24,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <main className="flex-1 container py-8 md:py-10">{children}</main>
         <footer className="border-t bg-card py-6">
           <div className="container flex flex-col items-center justify-between gap-2 text-xs text-muted-foreground sm:flex-row">
-            <span className="font-semibold text-foreground">Succession</span>
+            <span className="font-semibold text-foreground">Chronos</span>
             <span>Verified-financials marketplace for the silver-tsunami transition · MVP demo</span>
           </div>
         </footer>

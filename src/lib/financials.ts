@@ -1,5 +1,5 @@
 /**
- * Financial normalization engine — the core of Succession.
+ * Financial normalization engine — the core of Chronos.
  *
  * This module is pure (no IO, no framework deps) and fully unit-tested. It takes
  * messy owner-reported books and produces a transparent, itemized SDE and EBITDA

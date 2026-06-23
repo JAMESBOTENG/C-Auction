@@ -65,7 +65,7 @@ export default function LoginPage() {
           {mode === "login" && (
             <div className="mt-6 rounded-md bg-muted p-3 text-xs text-muted-foreground">
               <p className="mb-1 font-medium text-foreground">Demo logins (password: password123)</p>
-              <p>admin@succession.test · seller1@succession.test · buyer1@succession.test</p>
+              <p>admin@chronos.test · seller1@chronos.test · buyer1@chronos.test</p>
             </div>
           )}
         </CardContent>

@@ -1,4 +1,4 @@
-# Succession
+# Chronos
 
 A verified-financials marketplace for acquiring small, owner-operated US businesses from retiring
 founders. Every listing's messy owner books are normalized into a defensible **SDE** and **EBITDA**
@@ -39,22 +39,22 @@ All seeded accounts use the password **`password123`**.
 
 | Role   | Email                     |
 | ------ | ------------------------- |
-| ADMIN  | `admin@succession.test`   |
-| SELLER | `seller1@succession.test` |
-| SELLER | `seller2@succession.test` |
-| BUYER  | `buyer1@succession.test`  |
-| BUYER  | `buyer2@succession.test`  |
+| ADMIN  | `admin@chronos.test`   |
+| SELLER | `seller1@chronos.test` |
+| SELLER | `seller2@chronos.test` |
+| BUYER  | `buyer1@chronos.test`  |
+| BUYER  | `buyer2@chronos.test`  |
 
 You can also register new BUYER/SELLER accounts from the sign-in page.
 
 ## End-to-end happy path
-1. **Seller lists** — sign in as `seller1@succession.test`, click *List a business*, complete the
+1. **Seller lists** — sign in as `seller1@chronos.test`, click *List a business*, complete the
    wizard (profile → 3 years of financials → add-backs → review). The listing is created as a
    DRAFT; open it, upload a supporting doc, and *Submit for verification*.
-2. **Admin verifies** — sign in as `admin@succession.test`, open *Admin* → verification queue.
+2. **Admin verifies** — sign in as `admin@chronos.test`, open *Admin* → verification queue.
    Review the normalized SDE/EBITDA derivation, the add-back schedule, and any flags
    (uncategorized or >15%-of-revenue add-backs), then *Verify & publish* (or reject with notes).
-3. **Buyer discovers & unlocks** — sign in as `buyer1@succession.test`, *Browse*, filter by
+3. **Buyer discovers & unlocks** — sign in as `buyer1@chronos.test`, *Browse*, filter by
    industry / state / revenue / SDE / price / multiple. Open a listing (teaser metrics only),
    accept the NDA and attest proof of funds to submit an unlock request.
 4. **Admin approves** the unlock request from the Admin dashboard.

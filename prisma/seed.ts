@@ -394,19 +394,19 @@ async function main() {
   const passwordHash = await bcrypt.hash(PASSWORD, 10);
 
   const admin = await prisma.user.create({
-    data: { email: "admin@succession.test", name: "Avery Admin", role: "ADMIN", passwordHash },
+    data: { email: "admin@chronos.test", name: "Avery Admin", role: "ADMIN", passwordHash },
   });
   const seller1 = await prisma.user.create({
-    data: { email: "seller1@succession.test", name: "Sam Seller", role: "SELLER", passwordHash },
+    data: { email: "seller1@chronos.test", name: "Sam Seller", role: "SELLER", passwordHash },
   });
   const seller2 = await prisma.user.create({
-    data: { email: "seller2@succession.test", name: "Brooke Broker", role: "SELLER", passwordHash },
+    data: { email: "seller2@chronos.test", name: "Brooke Broker", role: "SELLER", passwordHash },
   });
   await prisma.user.create({
-    data: { email: "buyer1@succession.test", name: "Bailey Buyer", role: "BUYER", passwordHash },
+    data: { email: "buyer1@chronos.test", name: "Bailey Buyer", role: "BUYER", passwordHash },
   });
   await prisma.user.create({
-    data: { email: "buyer2@succession.test", name: "Quinn Acquirer", role: "BUYER", passwordHash },
+    data: { email: "buyer2@chronos.test", name: "Quinn Acquirer", role: "BUYER", passwordHash },
   });
 
   const sellers = [seller1, seller2];
@@ -453,9 +453,9 @@ async function main() {
   }
 
   console.log("\nDone. Login credentials (all password: password123):");
-  console.log("  ADMIN   admin@succession.test");
-  console.log("  SELLER  seller1@succession.test / seller2@succession.test");
-  console.log("  BUYER   buyer1@succession.test / buyer2@succession.test");
+  console.log("  ADMIN   admin@chronos.test");
+  console.log("  SELLER  seller1@chronos.test / seller2@chronos.test");
+  console.log("  BUYER   buyer1@chronos.test / buyer2@chronos.test");
 }
 
 main()

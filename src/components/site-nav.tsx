@@ -14,7 +14,7 @@ export async function SiteNav() {
           <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary">
             <Building2 className="size-4 text-primary-foreground" />
           </div>
-          <span className="text-base font-bold tracking-tight">Succession</span>
+          <span className="text-base font-bold tracking-tight">Chronos</span>
         </Link>
 
         <nav className="flex items-center gap-0.5">

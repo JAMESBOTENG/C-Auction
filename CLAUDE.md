@@ -1,7 +1,7 @@
 # CLAUDE.md — conventions & orientation
 
 ## What this is
-Succession — a verified-financials marketplace for SMB acquisitions. See `SPEC.md` for the full
+Chronos — a verified-financials marketplace for SMB acquisitions. See `SPEC.md` for the full
 product spec and `README.md` for setup/run instructions.
 
 ## How to run
