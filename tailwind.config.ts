@@ -12,7 +12,8 @@ const config: Config = {
     extend: {
       fontFamily: {
         sans: ["Inter", "system-ui", "sans-serif"],
-        display: ["Plus Jakarta Sans", "Inter", "system-ui", "sans-serif"],
+        display: ["Space Grotesk", "Inter", "system-ui", "sans-serif"],
+        mono: ["IBM Plex Mono", "ui-monospace", "SFMono-Regular", "monospace"],
       },
       colors: {
         border: "hsl(var(--border))",
@@ -52,30 +53,37 @@ const config: Config = {
           DEFAULT: "hsl(var(--warning))",
           foreground: "#ffffff",
         },
-        // Fixed brand accents for charts, chips and cover art.
+        // Finance-professional brand palette. Keys are kept stable so existing
+        // gradient classes keep working — they now resolve to navy/blue/emerald.
         brand: {
-          violet: "#6d4dfc",
-          indigo: "#4f46e5",
-          purple: "#a855f7",
-          fuchsia: "#d946ef",
-          pink: "#ec4899",
-          cyan: "#06b6d4",
-          teal: "#14b8a6",
-          amber: "#f59e0b",
-          emerald: "#10b981",
+          ink: "#0b1733",     // near-black navy (headlines / dark surfaces)
+          navy: "#0c2545",    // deep institutional navy
+          violet: "#13315c",  // (legacy key) → deep navy-blue
+          indigo: "#1e3a8a",
+          purple: "#1d4ed8",  // (legacy key) → royal blue
+          blue: "#2563eb",
+          fuchsia: "#2563eb", // (legacy key) → blue, so violet→fuchsia = navy→blue
+          pink: "#0ea5e9",    // (legacy key) → sky
+          sky: "#0ea5e9",
+          cyan: "#0891b2",
+          teal: "#0d9488",
+          emerald: "#059669",
+          amber: "#d97706",
+          gold: "#c08a2d",
+          slate: "#475569",
         },
       },
       borderRadius: {
         xl: "calc(var(--radius) + 4px)",
         lg: "var(--radius)",
         md: "calc(var(--radius) - 4px)",
-        sm: "calc(var(--radius) - 8px)",
+        sm: "calc(var(--radius) - 6px)",
       },
       boxShadow: {
-        card: "0 1px 3px 0 rgba(24,18,55,.06), 0 1px 2px -1px rgba(24,18,55,.05)",
-        elevated: "0 18px 40px -16px rgba(24,18,55,.18), 0 6px 16px -10px rgba(24,18,55,.10)",
-        glow: "0 16px 40px -12px rgba(109,77,252,.55)",
-        "glow-pink": "0 16px 40px -12px rgba(217,70,239,.5)",
+        card: "0 1px 3px 0 rgba(11,23,51,.06), 0 1px 2px -1px rgba(11,23,51,.05)",
+        elevated: "0 18px 40px -16px rgba(11,23,51,.20), 0 6px 16px -10px rgba(11,23,51,.12)",
+        glow: "0 16px 38px -14px rgba(13,49,92,.45)",
+        "glow-pink": "0 16px 38px -14px rgba(37,99,235,.40)",
       },
       keyframes: {
         "fade-up": {

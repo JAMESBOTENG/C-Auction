@@ -4,15 +4,18 @@ import { prisma } from "@/lib/prisma";
 import { auth } from "@/lib/auth";
 import { getListingAccess } from "@/lib/access";
 import { getNormalizedFinancials } from "@/lib/listing-data";
+import { buildWorkbook } from "@/lib/statements";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/misc";
 import { VerifiedBadge } from "@/components/verified-badge";
 import { FinancialSchedule } from "@/components/financial-schedule";
+import { FinancialStatements } from "@/components/financial-statements";
+import { TrendChart } from "@/components/trend-chart";
 import { UnlockForm } from "@/components/unlock-form";
 import { DealRoom } from "@/components/deal-room";
 import { ListingImage } from "@/components/listing-image";
 import { formatCurrency, formatMultiple, formatNumber } from "@/lib/utils";
-import { Lock, FileText, ChevronLeft, Users, CalendarDays, MapPin, MessageSquare } from "lucide-react";
+import { Lock, FileText, ChevronLeft, Users, CalendarDays, MapPin, MessageSquare, TrendingUp } from "lucide-react";
 
 export default async function ListingDetail({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
@@ -72,17 +75,42 @@ export default async function ListingDetail({ params }: { params: Promise<{ id: 
         <StatCard label="EBITDA multiple" value={formatMultiple(fin?.ebitdaMultiple)} />
       </div>
 
-      {/* Reason for sale */}
-      <div className="rounded-2xl border border-border/70 bg-card p-6 shadow-card">
-        <h2 className="mb-2 text-xs font-bold uppercase tracking-wider text-primary">Reason for sale</h2>
-        <p className="leading-relaxed text-foreground">{listing.reasonForSale}</p>
+      {/* Performance trend (teaser) + reason for sale */}
+      <div className="grid gap-6 lg:grid-cols-[1.55fr_1fr]">
+        {fin && fin.years.length > 0 && (
+          <div className="rounded-2xl border border-border/70 bg-card p-6 shadow-card">
+            <div className="mb-3 flex items-center gap-2">
+              <TrendingUp className="size-4 text-accent" />
+              <h2 className="text-xs font-bold uppercase tracking-wider text-muted-foreground">
+                {fin.years.length}-year performance
+              </h2>
+            </div>
+            <TrendChart
+              data={fin.years.map((y) => ({ label: String(y.year), revenue: y.revenue, sde: y.sde }))}
+            />
+          </div>
+        )}
+        <div className="rounded-2xl border border-border/70 bg-card p-6 shadow-card">
+          <h2 className="mb-2 text-xs font-bold uppercase tracking-wider text-primary">Reason for sale</h2>
+          <p className="leading-relaxed text-foreground">{listing.reasonForSale}</p>
+        </div>
       </div>
 
       {/* Gated section */}
       {access.unlocked ? (
         <div className="space-y-6">
           <Card>
-            <CardHeader><CardTitle>Normalized financials &amp; add-back schedule</CardTitle></CardHeader>
+            <CardHeader>
+              <CardTitle>Financial statements</CardTitle>
+              <p className="text-sm text-muted-foreground">
+                Income statement, balance sheet, cash flow and forecast — switch sheets like a workbook.
+              </p>
+            </CardHeader>
+            <CardContent>{fin && <FinancialStatements workbook={buildWorkbook(fin)} />}</CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader><CardTitle>SDE / EBITDA normalization &amp; add-back schedule</CardTitle></CardHeader>
             <CardContent>{fin && <FinancialSchedule fin={fin} showWarnings={isAdminView} />}</CardContent>
           </Card>
 
