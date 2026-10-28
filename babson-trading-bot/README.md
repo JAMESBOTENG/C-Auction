@@ -8,7 +8,25 @@
    `python rit_liability_bot.py --api-key YOURKEY --dry-run`
 4. Run it live: `python rit_liability_bot.py --api-key YOURKEY`. Press Ctrl+C to stop; that also cancels any open orders.
 
-## Check this first on the practice server: are the two markets netted?
+## Live dashboard
+When the bot starts, it opens **http://localhost:8050** in your browser. The page refreshes twice a second and shows:
+- **NLV / P&L chart** for the current round. Hover over it for the value at each tick.
+- **Tenders and auctions** as they arrive: the bot's edge, cost, net per share and decision. Each one has
+  **Accept / Bid** and **Decline** buttons to override the bot.
+- **Positions** per stock and per market, the market price, and volatility.
+- **Controls:**
+  - **Pause** stops new trades and cancels open orders.
+  - **Auto-accept on/off:** when off, the bot still evaluates tenders but you click Accept yourself.
+  - **Flatten all** closes every position now.
+  - **Cancel orders**.
+  - **LIVE / DRY RUN** switch.
+  - **Round preset 1-8**.
+  - **Strategy settings**, which apply instantly.
+- **Bot log**.
+
+`--dash-port 0` turns the dashboard off. `--no-browser` stops it opening automatically.
+
+ on the practice server: are the two markets netted?
 The bot treats `CRZY_M` and `CRZY_A` as **one inventory**. It may buy a tender on `_M` and sell part of it
 on `_A` when `_A` is cheaper, which can leave e.g. `CRZY_M +30,000 / CRZY_A -30,000`.
 On the practice server, accept a tender, let the bot unwind, then look at the Portfolio and

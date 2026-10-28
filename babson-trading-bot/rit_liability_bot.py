@@ -26,12 +26,17 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import math
+import queue
 import signal
 import sys
+import threading
 import time
+import webbrowser
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
 
@@ -46,6 +51,8 @@ class Config:
     port: int = 9999
     dry_run: bool = False
     loop_sleep: float = 0.15          # seconds between loops
+    dash_port: int = 8050             # live dashboard at http://localhost:8050 (0 = off)
+    no_browser: bool = False          # don't open the dashboard automatically
 
     # --- tender acceptance -------------------------------------------------------------------
     min_edge: float = 0.03            # $/share profit still required AFTER impact, fees and risk charge
@@ -179,6 +186,21 @@ def walk(levels: list[Level], qty: int, side: str, limit_net: float | None = Non
     return (notional / filled if filled else None), filled, per_ticker
 
 
+LOG = deque(maxlen=400)  # recent console lines, also shown on the dashboard
+
+
+def log(*parts, **_):
+    msg = " ".join(str(x) for x in parts)
+    LOG.append(time.strftime("%H:%M:%S ") + msg.strip("\n"))
+    print(msg, flush=True)
+
+
+# Settings the dashboard may change while the bot runs.
+TUNABLE = ["min_edge", "risk_aversion", "impact_weight", "unwind_ticks", "front_load", "max_slippage",
+           "passive", "passive_qty", "no_fines", "crowd_size", "arb", "fade_size", "fade_z",
+           "wta_extra_edge", "comp_extra_edge"]
+
+
 # --------------------------------------------------------------------------------------------------
 # The bot
 # --------------------------------------------------------------------------------------------------
@@ -188,6 +210,13 @@ class Bot:
         self.api = RIT(cfg)
         self.trader_id = None
         self.period = None
+        # dashboard controls (written by the web thread, read by the trading loop)
+        self.paused = False
+        self.auto_tenders = True
+        self.flatten_now = False
+        self.commands = queue.Queue()
+        self.state = {"connected": False, "log": []}
+        self.last_error = ""
         self.reset_period_state()
 
     def reset_period_state(self):
@@ -206,6 +235,9 @@ class Bot:
         self.passive_open = defaultdict(int)
         self.fade_block = {}
         self.busy = set()                  # unds with a live tender/auction (don't fade them)
+        self.nlv_hist = []                 # [tick, nlv] for the dashboard chart
+        self.tender_view = {}              # tender_id -> what the dashboard shows
+        self.stats = {"accepted": 0, "expected": 0.0, "auctions": 0}
 
     # ---------------------------------------------------------------- market data
     def snapshot(self, case):
@@ -328,11 +360,14 @@ class Bot:
     def log_tender(self, tid, msg):
         if self.tender_log.get(tid) != msg:
             self.tender_log[tid] = msg
-            print(msg, flush=True)
+            log(msg)
 
-    def handle_tenders(self, tick):
+    def handle_tenders(self, tick, act=True):
         tenders = self.api.get("/tenders") or []
         self.busy = {self.key(t["ticker"]) for t in tenders if t["ticker"] in self.secs}
+        live_ids = {t["tender_id"] for t in tenders}
+        self.tender_view = {k: v for k, v in self.tender_view.items() if k in live_ids}
+        act = act and self.auto_tenders and not self.paused
         for t in tenders:
             tid = t["tender_id"]
             ticker = t["ticker"]
@@ -355,26 +390,25 @@ class Bot:
                 net_edge = edge - need
                 tag = (f"[t{tick}] TENDER {tid} {'BUY' if we_buy else 'SELL'} {q:,} {ticker} @ {price:.2f} "
                        f"| mid {mid:.2f} edge {edge:+.3f} cost {need:.3f} -> net {net_edge:+.3f}/sh")
-                if net_edge >= self.cfg.min_edge and self.within_limits(signed):
-                    print(tag + f"  ACCEPT (exp. ${net_edge * q:,.0f})", flush=True)
-                    if not self.cfg.dry_run:
-                        self.api.post(f"/tenders/{tid}")
-                    self.accepted.add(tid)
-                    self.acquired_tick.setdefault(und, tick)
+                good = net_edge >= self.cfg.min_edge
+                self.tender_view[tid] = dict(id=tid, kind="fixed", side="BUY" if we_buy else "SELL", qty=q,
+                                             ticker=ticker, price=price, mid=mid, edge=edge, cost=need,
+                                             net=net_edge, expires=expires,
+                                             decision="WOULD ACCEPT" if good else "PASS")
+                if good and act and self.within_limits(signed):
+                    log(tag + f"  ACCEPT (exp. ${net_edge * q:,.0f})")
+                    self.accept_tender(tid, und, tick, expected=net_edge * q)
+                elif good and not act:
+                    self.log_tender(tid, tag + "  would ACCEPT - auto-accept is off (use the dashboard)")
                 else:
                     # keep watching: the market may move in our favour before it expires
                     self.log_tender(tid, tag + "  pass (watching until expiry)")
             else:
                 wta = "winner" in caption or "highest" in caption or "lowest" in caption
-                if (self.cfg.no_fines and not wta and self.cfg.crowd_size and tid not in self.crowd_done
+                if (act and self.cfg.no_fines and not wta and self.cfg.crowd_size and tid not in self.crowd_done
                         and expires - tick <= self.cfg.crowd_ticks):
                     self.crowd_trade(und, we_buy, expires, tick)
                     self.crowd_done.add(tid)
-                if tid in self.auction_done or expires - tick > self.cfg.auction_submit_before:
-                    if tid not in self.auction_done:
-                        self.log_tender(tid, f"AUCTION {tid} {t['action']} {q:,} {ticker} "
-                                             f"- will bid at t{expires - self.cfg.auction_submit_before}")
-                    continue
                 mult = 1.0 if wta else self.cfg.comp_impact_mult
                 extra = self.cfg.wta_extra_edge if wta else self.cfg.comp_extra_edge
                 mid, need = self.tender_cost_per_share(und, signed, mult, exclude_crowd=True)
@@ -383,17 +417,41 @@ class Bot:
                 disc = need + self.cfg.min_edge + extra
                 bid = math.floor((mid - disc) * 100) / 100 if we_buy else math.ceil((mid + disc) * 100) / 100
                 kind = "winner-take-all" if wta else "competitive"
+                if tid not in self.auction_done:
+                    self.tender_view[tid] = dict(id=tid, kind=kind, side="BUY" if we_buy else "SELL", qty=q,
+                                                 ticker=ticker, price=bid, mid=mid, edge=disc, cost=need,
+                                                 net=self.cfg.min_edge + extra, expires=expires,
+                                                 decision=f"BID AT t{expires - self.cfg.auction_submit_before}")
+                if tid in self.auction_done or expires - tick > self.cfg.auction_submit_before or not act:
+                    if tid not in self.auction_done:
+                        self.log_tender(tid, f"AUCTION {tid} {t['action']} {q:,} {ticker} "
+                                             f"- will bid at t{expires - self.cfg.auction_submit_before}")
+                    continue
                 if not self.within_limits(signed):
-                    print(f"[t{tick}] AUCTION {tid} skipped: would breach position limits", flush=True)
+                    log(f"[t{tick}] AUCTION {tid} skipped: would breach position limits")
                 else:
-                    print(f"[t{tick}] AUCTION {tid} ({kind}) {'BUY' if we_buy else 'SELL'} {q:,} {ticker} "
-                          f"| mid {mid:.2f} -> submit {bid:.2f}", flush=True)
-                    if not self.cfg.dry_run:
-                        try:
-                            self.api.post(f"/tenders/{tid}", price=bid)
-                        except RuntimeError as e:
-                            print("  auction submit failed:", e, flush=True)
+                    log(f"[t{tick}] AUCTION {tid} ({kind}) {'BUY' if we_buy else 'SELL'} {q:,} {ticker} "
+                          f"| mid {mid:.2f} -> submit {bid:.2f}")
+                    self.submit_auction(tid, bid)
                 self.auction_done.add(tid)
+
+    def accept_tender(self, tid, und, tick, expected=0.0):
+        if not self.cfg.dry_run:
+            self.api.post(f"/tenders/{tid}")
+        self.accepted.add(tid)
+        self.acquired_tick.setdefault(und, tick)
+        self.stats["accepted"] += 1
+        self.stats["expected"] += expected
+
+    def submit_auction(self, tid, price):
+        if not self.cfg.dry_run:
+            try:
+                self.api.post(f"/tenders/{tid}", price=price)
+            except RuntimeError as e:
+                log("  auction submit failed:", e)
+                return
+        self.stats["auctions"] += 1
+        self.auction_done.add(tid)
 
     def crowd_trade(self, und, crowd_buys, expires, tick):
         """Competitive auction: every winner will dump the block right after it closes. Get there first:
@@ -407,7 +465,7 @@ class Bot:
             return
         limit_net = lv[0].net - self.cfg.max_slippage if side == "SELL" else lv[0].net + self.cfg.max_slippage
         _, filled, per_ticker = walk(lv, self.cfg.crowd_size, side, limit_net)
-        print(f"[t{tick}] CROWD {side} {filled:,} {und} ahead of auction unwind (hold to t{expires + self.cfg.crowd_hold})",
+        log(f"[t{tick}] CROWD {side} {filled:,} {und} ahead of auction unwind (hold to t{expires + self.cfg.crowd_hold})",
               flush=True)
         for t, (q, worst_raw) in per_ticker.items():
             self.send(t, side, q, worst_raw)
@@ -430,7 +488,7 @@ class Bot:
                         q = min(int(sa.get("ask_size") or 0), int(sb.get("bid_size") or 0), self.cfg.arb_max_qty)
                         if q <= 0:
                             continue
-                        print(f"[t{tick}] ARB buy {q:,} {a} @ {ask:.2f} / sell {b} @ {bid:.2f}", flush=True)
+                        log(f"[t{tick}] ARB buy {q:,} {a} @ {ask:.2f} / sell {b} @ {bid:.2f}")
                         self.send(a, "BUY", q, ask)
                         self.send(b, "SELL", q, bid)
                         self.arb_tick[und] = tick
@@ -458,7 +516,7 @@ class Bot:
             _, filled, per_ticker = walk(lv, self.cfg.fade_size, side, limit_net)
             if not filled:
                 continue
-            print(f"[t{tick}] FADE {side} {filled:,} {und}: {move * 100:+.2f}% in {k} ticks ({abs(move) / sd:.1f} sd)",
+            log(f"[t{tick}] FADE {side} {filled:,} {und}: {move * 100:+.2f}% in {k} ticks ({abs(move) / sd:.1f} sd)",
                   flush=True)
             for t, (q, worst_raw) in per_ticker.items():
                 self.send(t, side, q, worst_raw)
@@ -476,13 +534,13 @@ class Bot:
                 self.acquired_tick.pop(und, None)
                 continue
             self.acquired_tick.setdefault(und, tick)
-            if tick <= self.hold_until.get(und, -1) and ticks_left > self.cfg.endgame_ticks:
+            endgame = ticks_left <= self.cfg.endgame_ticks or self.flatten_now
+            if tick <= self.hold_until.get(und, -1) and not endgame:
                 continue
-            if self.slices[(und, tick)] >= self.cfg.orders_per_tick and ticks_left > self.cfg.endgame_ticks:
+            if self.slices[(und, tick)] >= self.cfg.orders_per_tick and not endgame:
                 continue
 
             held = tick - self.acquired_tick[und]
-            endgame = ticks_left <= self.cfg.endgame_ticks
             side = "SELL" if pos > 0 else "BUY"
             resting = self.passive_open.get(und, 0)
             if (self.cfg.passive and not endgame and held < self.cfg.unwind_ticks and resting == 0
@@ -515,7 +573,7 @@ class Bot:
         while qty > 0:
             q = min(qty, max_sz)
             if self.cfg.dry_run:
-                print(f"    (dry) {side} {q} {ticker} @ {price:.2f}")
+                log(f"    (dry) {side} {q} {ticker} @ {price:.2f}")
             else:
                 self.api.post("/orders", ticker=ticker, type="LIMIT", quantity=q, action=side,
                               price=round(price, 2))
@@ -570,7 +628,7 @@ class Bot:
             return 0
         _, t, px = best
         if self.cfg.dry_run:
-            print(f"    (dry) passive {side} {qty} {t} @ {px:.2f}")
+            log(f"    (dry) passive {side} {qty} {t} @ {px:.2f}")
             return qty
         o = self.api.post("/orders", ticker=t, type="LIMIT", quantity=qty, action=side, price=round(px, 2))
         if o and "order_id" in o:
@@ -581,40 +639,161 @@ class Bot:
     def run(self):
         me = self.api.get("/trader")
         self.trader_id = me.get("trader_id")
-        print(f"Connected as {self.trader_id}. NLV ${me.get('nlv', 0):,.0f}. "
-              f"{'DRY RUN - no orders' if self.cfg.dry_run else 'LIVE'}", flush=True)
+        log(f"Connected as {self.trader_id}. NLV ${me.get('nlv', 0):,.0f}. "
+              f"{'DRY RUN - no orders' if self.cfg.dry_run else 'LIVE'}")
         last_status_tick = None
+        last_nlv_tick = None
+        nlv = me.get("nlv", 0)
+        case = {}
         while True:
             try:
+                self.process_commands()
                 case = self.api.get("/case")
                 if case["status"] != "ACTIVE":
+                    self.publish_state(case, nlv, connected=True)
                     time.sleep(0.5)
                     continue
                 if case["period"] != self.period:
                     self.period = case["period"]
                     self.reset_period_state()
-                    print(f"=== period {self.period} ===", flush=True)
+                    log(f"=== period {self.period} ===")
                 tick = case["tick"]
                 self.ticks_left = case["ticks_per_period"] - tick
                 self.snapshot(case)
-                self.manage_orders(tick)
+                if not self.paused:
+                    self.manage_orders(tick)
                 self.record_mids(tick)
                 self.handle_tenders(tick)
                 self.snapshot(case)                # refresh positions after any accepted tender
-                self.unwind(case)
-                self.arbitrage(tick)
-                self.fade(tick)
+                if not self.paused or self.flatten_now:
+                    self.unwind(case)
+                if not self.paused:
+                    self.arbitrage(tick)
+                    self.fade(tick)
+                if self.flatten_now and all(self.position(u) == 0 for u in self.und_tickers):
+                    self.flatten_now = False
+                    log(f"[t{tick}] flat - flatten complete")
+                if tick != last_nlv_tick:
+                    last_nlv_tick = tick
+                    nlv = self.api.get("/trader").get("nlv", 0)
+                    self.nlv_hist.append([tick, round(nlv, 2)])
                 if tick != last_status_tick and tick % 10 == 0:
                     last_status_tick = tick
-                    nlv = self.api.get("/trader").get("nlv", 0)
                     pos = ", ".join(f"{u}:{self.position(u):+,}" for u in self.und_tickers)
-                    print(f"[t{tick}/{case['ticks_per_period']}] NLV ${nlv:,.0f} | {pos}", flush=True)
+                    log(f"[t{tick}/{case['ticks_per_period']}] NLV ${nlv:,.0f} | {pos}")
+                self.publish_state(case, nlv, connected=True)
             except requests.exceptions.ConnectionError:
-                print("Cannot reach RIT client API - is RIT open, logged in, and API enabled?", flush=True)
+                self.last_error = "Cannot reach RIT client API - is RIT open, logged in, and API enabled?"
+                log(self.last_error)
+                self.publish_state(case, nlv, connected=False)
                 time.sleep(2)
             except RuntimeError as e:
-                print("API error:", e, flush=True)
+                self.last_error = f"API error: {e}"
+                log(self.last_error)
             time.sleep(self.cfg.loop_sleep)
+
+    # ---------------------------------------------------------------- dashboard plumbing
+    def process_commands(self):
+        """Run dashboard commands on the trading thread (one thread talks to RIT)."""
+        while True:
+            try:
+                cmd = self.commands.get_nowait()
+            except queue.Empty:
+                return
+            action = cmd.get("action")
+            try:
+                if action == "cancel_all":
+                    if not self.cfg.dry_run:
+                        self.api.post("/commands/cancel", all=1)
+                    self.passive_ids.clear()
+                    log("[dash] cancelled all open orders")
+                elif action == "accept":
+                    v = self.tender_view.get(int(cmd["id"]))
+                    if not v:
+                        log(f"[dash] tender {cmd['id']} is gone")
+                    elif v["kind"] == "fixed":
+                        log(f"[dash] manual ACCEPT tender {v['id']} {v['side']} {v['qty']:,} {v['ticker']} @ {v['price']:.2f}")
+                        self.accept_tender(v["id"], self.key(v["ticker"]), self.state.get("tick", 0),
+                                           expected=v["net"] * v["qty"])
+                    else:
+                        price = float(cmd.get("price") or v["price"])
+                        log(f"[dash] manual auction bid {v['id']} @ {price:.2f}")
+                        self.submit_auction(v["id"], price)
+                elif action == "decline":
+                    tid = int(cmd["id"])
+                    if not self.cfg.dry_run:
+                        self.api.delete(f"/tenders/{tid}")
+                    self.auction_done.add(tid)
+                    self.accepted.add(tid)
+                    log(f"[dash] declined tender {tid}")
+            except (RuntimeError, ValueError, KeyError) as e:
+                log(f"[dash] {action} failed: {e}")
+
+    def control(self, cmd: dict):
+        """Called from the web thread. Flags/settings change immediately; RIT calls are queued."""
+        a = cmd.get("action")
+        if a == "pause":
+            self.paused = True
+            self.commands.put({"action": "cancel_all"})
+            log("[dash] PAUSED - no new trades, open orders cancelled")
+        elif a == "resume":
+            self.paused = False
+            log("[dash] resumed")
+        elif a == "auto_tenders":
+            self.auto_tenders = bool(cmd.get("value"))
+            log(f"[dash] auto-accept {'ON' if self.auto_tenders else 'OFF'}")
+        elif a == "flatten":
+            self.flatten_now = True
+            log("[dash] FLATTEN - closing every position now")
+        elif a == "dry_run":
+            self.cfg.dry_run = bool(cmd.get("value"))
+            log(f"[dash] mode -> {'DRY RUN' if self.cfg.dry_run else 'LIVE'}")
+        elif a == "round":
+            self.apply_round(int(cmd["value"]))
+        elif a == "set":
+            key = cmd.get("key")
+            if key not in TUNABLE:
+                return {"ok": False, "error": f"{key} is not adjustable"}
+            cur = getattr(self.cfg, key)
+            val = cmd.get("value")
+            val = (val in (True, "true", "1", 1, "on")) if isinstance(cur, bool) else type(cur)(float(val))
+            setattr(self.cfg, key, val)
+            log(f"[dash] {key} = {val}")
+        elif a in ("cancel_all", "accept", "decline"):
+            self.commands.put(cmd)
+        else:
+            return {"ok": False, "error": f"unknown action {a}"}
+        return {"ok": True}
+
+    def apply_round(self, r: int):
+        base = Config()
+        for k in set().union(*ROUND_PRESETS.values()):
+            setattr(self.cfg, k, getattr(base, k))
+        for k, v in ROUND_PRESETS.get(r, {}).items():
+            setattr(self.cfg, k, v)
+        self.cfg.round = r
+        log(f"[dash] round {r} preset loaded")
+
+    def publish_state(self, case, nlv, connected):
+        stocks = []
+        for und, tks in getattr(self, "und_tickers", {}).items():
+            mid = self.mid(und)
+            stocks.append({
+                "name": und, "position": self.position(und), "mid": mid,
+                "vol": self.tick_vol(und) * 100,
+                "markets": [{"ticker": t, "bid": self.secs[t].get("bid"), "ask": self.secs[t].get("ask"),
+                             "position": self.secs[t].get("position", 0)} for t in tks],
+            })
+        self.state = {
+            "connected": connected, "trader": self.trader_id, "live": not self.cfg.dry_run,
+            "paused": self.paused, "auto_tenders": self.auto_tenders, "flatten": self.flatten_now,
+            "status": case.get("status", "?"), "period": case.get("period"), "tick": case.get("tick", 0),
+            "tpp": case.get("ticks_per_period", 300), "nlv": nlv, "nlv_hist": self.nlv_hist[-1500:],
+            "stocks": stocks, "tenders": sorted(self.tender_view.values(), key=lambda v: v["id"]),
+            "stats": self.stats, "round": self.cfg.round,
+            "config": {k: getattr(self.cfg, k) for k in TUNABLE},
+            "log": list(LOG)[-150:], "error": self.last_error,
+        }
 
 
 def parse_args() -> Config:
@@ -639,11 +818,423 @@ def parse_args() -> Config:
     return cfg
 
 
+def start_dashboard(bot: Bot):
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def send(self, code, body, ctype):
+            data = body.encode() if isinstance(body, str) else body
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            if self.path.startswith("/api/state"):
+                self.send(200, json.dumps(bot.state), "application/json")
+            elif self.path in ("/", "/index.html"):
+                self.send(200, DASHBOARD_HTML, "text/html; charset=utf-8")
+            else:
+                self.send(404, "not found", "text/plain")
+
+        def do_POST(self):
+            if self.path != "/api/control":
+                return self.send(404, "not found", "text/plain")
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                res = bot.control(json.loads(self.rfile.read(n) or b"{}"))
+            except Exception as e:  # never let a bad click kill the server thread
+                res = {"ok": False, "error": str(e)}
+            self.send(200, json.dumps(res), "application/json")
+
+    srv = ThreadingHTTPServer(("127.0.0.1", bot.cfg.dash_port), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://localhost:{bot.cfg.dash_port}"
+    log(f"Dashboard: {url}")
+    if not bot.cfg.no_browser:
+        threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+
+
+
+
+# The dashboard page (served at http://localhost:8050 while the bot runs).
+DASHBOARD_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RIT Bot Control</title>
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f4f4f2; --surface-1: #fcfcfb; --surface-2: #efefec; --border: #dddcd7;
+  --text-primary: #0b0b0b; --text-secondary: #52514e; --text-muted: #7a7974;
+  --series-1: #2a78d6; --grid: #e6e5e1; --zero: #b9b8b2;
+  --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b;
+  --btn: #ffffff; --btn-hover: #f0efec;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --bg: #111110; --surface-1: #1a1a19; --surface-2: #232321; --border: #33332f;
+    --text-primary: #f0efec; --text-secondary: #c3c2b7; --text-muted: #8f8e86;
+    --series-1: #3987e5; --grid: #2a2a27; --zero: #55544f; --btn: #232321; --btn-hover: #2d2d2a;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #111110; --surface-1: #1a1a19; --surface-2: #232321; --border: #33332f;
+  --text-primary: #f0efec; --text-secondary: #c3c2b7; --text-muted: #8f8e86;
+  --series-1: #3987e5; --grid: #2a2a27; --zero: #55544f; --btn: #232321; --btn-hover: #2d2d2a;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text-primary);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+header { position: sticky; top: 0; z-index: 5; background: var(--surface-1); border-bottom: 1px solid var(--border);
+  padding: 10px 16px; display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+header h1 { font-size: 16px; margin: 0 8px 0 0; font-weight: 650; }
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px;
+  border: 1px solid var(--border); font-size: 12px; font-weight: 600; color: var(--text-secondary); background: var(--surface-2); }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); }
+.dot.good { background: var(--good); } .dot.warning { background: var(--warning); } .dot.critical { background: var(--critical); }
+.progress { flex: 1 1 160px; min-width: 120px; height: 6px; background: var(--surface-2); border-radius: 3px; overflow: hidden; }
+.progress > div { height: 100%; background: var(--text-muted); width: 0; transition: width .4s; }
+main { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 14px; padding: 14px 16px 24px; max-width: 1400px; margin: 0 auto; }
+@media (max-width: 960px) { main { grid-template-columns: minmax(0, 1fr); } }
+.col { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 14px; min-width: 0; }
+.card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--text-secondary); margin: 0 0 10px; font-weight: 650; }
+.hero { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 18px; }
+.hero .big { font-size: 34px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.hero .sub { color: var(--text-secondary); }
+.stats { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 4px; color: var(--text-secondary); font-size: 13px; }
+.stats b { color: var(--text-primary); font-variant-numeric: tabular-nums; }
+.chart-wrap { position: relative; margin-top: 10px; }
+svg text { fill: var(--text-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.tip { position: absolute; pointer-events: none; background: var(--surface-1); border: 1px solid var(--border);
+  border-radius: 6px; padding: 4px 8px; font-size: 12px; white-space: nowrap; display: none; box-shadow: 0 2px 8px rgba(0,0,0,.12); }
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+th, td { text-align: right; padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+th { color: var(--text-secondary); font-weight: 600; font-size: 12px; }
+th:first-child, td:first-child { text-align: left; }
+.scroll-x { overflow-x: auto; }
+.empty { color: var(--text-muted); padding: 10px 0; }
+.badge { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 700; padding: 2px 8px;
+  border-radius: 4px; border: 1px solid var(--border); color: var(--text-primary); background: var(--surface-2); }
+.badge::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--text-muted); }
+.badge.good::before { background: var(--good); } .badge.warning::before { background: var(--warning); }
+.badge.serious::before { background: var(--serious); }
+button { font: inherit; font-weight: 600; cursor: pointer; border: 1px solid var(--border); background: var(--btn);
+  color: var(--text-primary); border-radius: 7px; padding: 8px 12px; }
+button:hover { background: var(--btn-hover); }
+button:disabled { opacity: .45; cursor: default; }
+button.small { padding: 3px 9px; font-size: 12px; }
+button.danger { border-color: var(--critical); color: var(--critical); }
+button.on { outline: 2px solid var(--series-1); outline-offset: -2px; }
+.controls { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.controls .wide { grid-column: span 2; }
+.rounds { display: grid; grid-template-columns: repeat(8, 1fr); gap: 4px; }
+.rounds button { padding: 6px 0; }
+.params { display: grid; grid-template-columns: 1fr 96px; gap: 6px 10px; align-items: center; }
+.params label { color: var(--text-secondary); font-size: 13px; }
+.params input[type=number] { width: 100%; font: inherit; font-variant-numeric: tabular-nums; padding: 4px 6px;
+  border: 1px solid var(--border); border-radius: 6px; background: var(--surface-2); color: var(--text-primary); text-align: right; }
+.params input.saved { outline: 2px solid var(--good); }
+.hint { color: var(--text-muted); font-size: 12px; margin: 8px 0 0; }
+#log { font: 12px/1.5 var(--mono); height: 340px; overflow: auto; background: var(--surface-2); border-radius: 6px;
+  padding: 8px; white-space: pre-wrap; word-break: break-word; color: var(--text-secondary); }
+.banner { display: none; background: var(--surface-1); border: 1px solid var(--critical); color: var(--text-primary);
+  border-radius: 8px; padding: 10px 14px; margin: 14px 16px 0; }
+.mkt { color: var(--text-muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>RIT Bot Control</h1>
+  <span class="pill"><span id="connDot" class="dot"></span><span id="conn">connecting</span></span>
+  <span class="pill" id="modePill"><span id="modeDot" class="dot"></span><span id="mode">-</span></span>
+  <span class="pill" id="statePill"><span id="stateDot" class="dot"></span><span id="state">-</span></span>
+  <span class="pill" id="roundPill">Round -</span>
+  <span class="pill" id="tickPill">tick -</span>
+  <div class="progress" aria-hidden="true"><div id="prog"></div></div>
+  <button class="small" id="themeBtn" title="Toggle light/dark">Theme</button>
+</header>
+<div class="banner" id="banner"></div>
+<main>
+  <div class="col">
+    <section class="card">
+      <h2>Net liquidation value (P&amp;L this round)</h2>
+      <div class="hero"><span class="big" id="nlv">$0</span><span class="sub" id="nlvSub"></span></div>
+      <div class="stats" id="stats"></div>
+      <div class="chart-wrap" id="chartWrap">
+        <svg id="chart" role="img" aria-label="NLV over ticks this round"></svg>
+        <div class="tip" id="tip"></div>
+      </div>
+    </section>
+    <section class="card">
+      <h2>Tenders &amp; auctions</h2>
+      <div class="scroll-x" id="tenders"></div>
+      <p class="hint">Net = expected profit per share after impact, fees and risk. The bot auto-accepts when net &ge; min edge (if auto-accept is on). Use the buttons to override.</p>
+    </section>
+    <section class="card">
+      <h2>Positions</h2>
+      <div class="scroll-x" id="positions"></div>
+    </section>
+  </div>
+  <div class="col">
+    <section class="card">
+      <h2>Controls</h2>
+      <div class="controls">
+        <button id="pauseBtn" class="wide">Pause trading</button>
+        <button id="autoBtn">Auto-accept: on</button>
+        <button id="dryBtn">Mode</button>
+        <button id="flattenBtn" class="danger">Flatten all</button>
+        <button id="cancelBtn">Cancel orders</button>
+      </div>
+      <p class="hint">Pause stops all new trades and cancels open orders. Flatten closes every position now, even while paused.</p>
+      <h2 style="margin-top:14px">Round preset</h2>
+      <div class="rounds" id="rounds"></div>
+    </section>
+    <section class="card">
+      <h2>Strategy settings</h2>
+      <div class="params" id="params"></div>
+      <p class="hint">Changes apply instantly. Picking a round preset resets these to that round's values.</p>
+    </section>
+    <section class="card">
+      <h2>Bot log</h2>
+      <div id="log"></div>
+    </section>
+  </div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const fmt$ = (v) => (v < 0 ? "-$" : "$") + Math.abs(Math.round(v)).toLocaleString();
+const fmtN = (v, d = 2) => (v == null ? "-" : Number(v).toFixed(d));
+const signed = (v) => (v > 0 ? "+" : "") + Math.round(v).toLocaleString();
+let S = null;
+
+const PARAMS = [
+  ["min_edge", "Min edge $/share", 0.005],
+  ["risk_aversion", "Risk aversion", 0.1],
+  ["impact_weight", "Impact weight", 0.1],
+  ["unwind_ticks", "Unwind ticks", 1],
+  ["front_load", "Front-load", 0.1],
+  ["max_slippage", "Max slippage $", 0.01],
+  ["passive", "Passive unwinding", "bool"],
+  ["passive_qty", "Passive size", 1000],
+  ["no_fines", "No-fines mode (R5-8)", "bool"],
+  ["crowd_size", "Crowd trade size", 5000],
+  ["arb", "Cross-market arb", "bool"],
+  ["fade_size", "Fade size (0 = off)", 5000],
+  ["fade_z", "Fade trigger (sd)", 0.5],
+  ["wta_extra_edge", "WTA auction margin", 0.01],
+  ["comp_extra_edge", "Comp. auction margin", 0.01],
+];
+
+async function control(body) {
+  try {
+    const r = await fetch("/api/control", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const j = await r.json();
+    if (!j.ok) alert(j.error || "failed");
+    poll();
+    return j.ok;
+  } catch (e) { alert("Bot not reachable: " + e); }
+}
+
+// ---- static UI ----
+for (let r = 1; r <= 8; r++) {
+  const b = document.createElement("button");
+  b.textContent = r; b.dataset.r = r;
+  b.onclick = () => control({ action: "round", value: r });
+  $("rounds").appendChild(b);
+}
+for (const [key, label, step] of PARAMS) {
+  const l = document.createElement("label"); l.htmlFor = "p_" + key; l.textContent = label;
+  let inp;
+  if (step === "bool") {
+    inp = document.createElement("input"); inp.type = "checkbox";
+    inp.onchange = () => control({ action: "set", key, value: inp.checked });
+  } else {
+    inp = document.createElement("input"); inp.type = "number"; inp.step = step;
+    inp.onchange = async () => {
+      if (await control({ action: "set", key, value: inp.value })) {
+        inp.classList.add("saved"); setTimeout(() => inp.classList.remove("saved"), 700);
+      }
+    };
+  }
+  inp.id = "p_" + key;
+  $("params").append(l, inp);
+}
+$("pauseBtn").onclick = () => control({ action: S && S.paused ? "resume" : "pause" });
+$("autoBtn").onclick = () => control({ action: "auto_tenders", value: !(S && S.auto_tenders) });
+$("flattenBtn").onclick = () => confirm("Close every position now with aggressive orders?") && control({ action: "flatten" });
+$("cancelBtn").onclick = () => control({ action: "cancel_all" });
+$("dryBtn").onclick = () => {
+  if (!S) return;
+  if (!S.live && !confirm("Switch to LIVE? The bot will start sending real orders and accepting tenders.")) return;
+  control({ action: "dry_run", value: S.live });
+};
+$("themeBtn").onclick = () => {
+  const root = document.documentElement;
+  const dark = root.dataset.theme ? root.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+  root.dataset.theme = dark ? "light" : "dark";
+  try { localStorage.setItem("ritTheme", root.dataset.theme); } catch (e) {}
+  if (S) drawChart(S);
+};
+try { const t = localStorage.getItem("ritTheme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}
+
+// ---- chart ----
+let chartPts = [], chartGeom = null, lastMouse = null;
+function drawChart(s) {
+  const svg = $("chart"), W = $("chartWrap").clientWidth, H = 240;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`); svg.setAttribute("width", W); svg.setAttribute("height", H);
+  const pts = s.nlv_hist || []; chartPts = pts;
+  const L = 64, R = 12, T = 10, B = 24, tpp = s.tpp || 300;
+  let lo = Math.min(0, ...pts.map(p => p[1])), hi = Math.max(0, ...pts.map(p => p[1]));
+  if (hi - lo < 1000) { hi += 500; lo -= 500; }
+  const pad = (hi - lo) * 0.08; hi += pad; lo -= pad;
+  const x = (t) => L + (t / tpp) * (W - L - R), y = (v) => T + (hi - v) / (hi - lo) * (H - T - B);
+  chartGeom = { x, y, L, R, T, B, W, H, tpp };
+  let g = "";
+  const step = niceStep((hi - lo) / 4);
+  for (let v = Math.ceil(lo / step) * step; v <= hi; v += step) {
+    const yy = y(v).toFixed(1);
+    g += `<line x1="${L}" x2="${W - R}" y1="${yy}" y2="${yy}" stroke="${Math.abs(v) < 1e-6 ? "var(--zero)" : "var(--grid)"}" stroke-width="1"/>`;
+    g += `<text x="${L - 8}" y="${+yy + 4}" text-anchor="end">${fmt$(v)}</text>`;
+  }
+  for (let t = 0; t <= tpp; t += 50) g += `<text x="${x(t)}" y="${H - 6}" text-anchor="middle">${t}</text>`;
+  if (pts.length > 1) {
+    const d = pts.map((p, i) => (i ? "L" : "M") + x(p[0]).toFixed(1) + "," + y(p[1]).toFixed(1)).join("");
+    g += `<path d="${d}" fill="none" stroke="var(--series-1)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+  } else {
+    g += `<text x="${(L + W - R) / 2}" y="${H / 2}" text-anchor="middle">P&amp;L appears once the round is running</text>`;
+  }
+  g += `<g id="cross" style="display:none"><line id="cx" y1="${T}" y2="${H - B}" stroke="var(--text-muted)" stroke-width="1" stroke-dasharray="3 3"/>
+        <circle id="cdot" r="5" fill="var(--series-1)" stroke="var(--surface-1)" stroke-width="2"/></g>
+        <rect x="${L}" y="${T}" width="${W - L - R}" height="${H - T - B}" fill="transparent" id="hit"/>`;
+  svg.innerHTML = g;
+  const hit = $("hit");
+  hit.onmousemove = (e) => { lastMouse = e; showTip(e); };
+  hit.onmouseleave = () => { lastMouse = null; hideTip(); };
+  if (lastMouse) showTip(lastMouse);
+}
+function niceStep(raw) {
+  const p = Math.pow(10, Math.floor(Math.log10(raw || 1))), n = raw / p;
+  return (n < 1.5 ? 1 : n < 3 ? 2 : n < 7 ? 5 : 10) * p;
+}
+function showTip(e) {
+  if (!chartPts.length || !chartGeom) return;
+  const rect = $("chart").getBoundingClientRect(), mx = e.clientX - rect.left;
+  const { x, y, L, R, W, tpp } = chartGeom;
+  const t = (mx - L) / (W - L - R) * tpp;
+  let best = chartPts[0];
+  for (const p of chartPts) if (Math.abs(p[0] - t) < Math.abs(best[0] - t)) best = p;
+  const px = x(best[0]), py = y(best[1]);
+  $("cross").style.display = ""; $("cx").setAttribute("x1", px); $("cx").setAttribute("x2", px);
+  $("cdot").setAttribute("cx", px); $("cdot").setAttribute("cy", py);
+  const tip = $("tip"); tip.style.display = "block";
+  tip.innerHTML = `<b>${fmt$(best[1])}</b> &nbsp;tick ${best[0]}`;
+  const tw = tip.offsetWidth;
+  tip.style.left = Math.min(Math.max(px - tw / 2, 0), W - tw) + "px"; tip.style.top = Math.max(py - 40, 0) + "px";
+}
+function hideTip() { $("tip").style.display = "none"; const c = $("cross"); if (c) c.style.display = "none"; }
+
+// ---- render ----
+function setPill(dotId, textId, text, cls) { $(textId).textContent = text; $(dotId).className = "dot " + (cls || ""); }
+function render(s) {
+  S = s;
+  setPill("connDot", "conn", s.connected ? "RIT connected" + (s.trader ? " · " + s.trader : "") : "RIT not reachable", s.connected ? "good" : "critical");
+  setPill("modeDot", "mode", s.live ? "LIVE" : "DRY RUN", s.live ? "good" : "warning");
+  const st = s.flatten ? "FLATTENING" : s.paused ? "PAUSED" : s.status === "ACTIVE" ? "RUNNING" : "WAITING (" + s.status + ")";
+  setPill("stateDot", "state", st, s.flatten ? "critical" : s.paused ? "warning" : s.status === "ACTIVE" ? "good" : "");
+  $("roundPill").textContent = "Round " + (s.round || "-");
+  $("tickPill").textContent = `period ${s.period ?? "-"} · tick ${s.tick ?? 0}/${s.tpp ?? 300}`;
+  $("prog").style.width = ((s.tick || 0) / (s.tpp || 300) * 100).toFixed(1) + "%";
+  const b = $("banner");
+  if (!s.connected && s.error) { b.style.display = "block"; b.textContent = s.error; } else b.style.display = "none";
+
+  $("nlv").textContent = fmt$(s.nlv || 0);
+  const st2 = s.stats || {};
+  $("stats").innerHTML = `<span>Tenders accepted <b>${st2.accepted || 0}</b></span><span>Expected from tenders <b>${fmt$(st2.expected || 0)}</b></span><span>Auction bids <b>${st2.auctions || 0}</b></span>`;
+  drawChart(s);
+
+  // controls
+  $("pauseBtn").textContent = s.paused ? "Resume trading" : "Pause trading";
+  $("pauseBtn").classList.toggle("on", s.paused);
+  $("autoBtn").textContent = "Auto-accept: " + (s.auto_tenders ? "on" : "off");
+  $("autoBtn").classList.toggle("on", !s.auto_tenders);
+  $("dryBtn").textContent = s.live ? "Mode: LIVE" : "Mode: DRY RUN";
+  for (const btn of $("rounds").children) btn.classList.toggle("on", +btn.dataset.r === s.round);
+  for (const [key, , step] of PARAMS) {
+    const inp = $("p_" + key), v = s.config[key];
+    if (document.activeElement === inp) continue;
+    if (step === "bool") inp.checked = !!v; else if (String(inp.value) !== String(v)) inp.value = v;
+  }
+
+  // tenders
+  const tv = s.tenders || [];
+  if (!tv.length) $("tenders").innerHTML = `<div class="empty">No open tenders. New ones appear here the moment RIT sends them.</div>`;
+  else {
+    let h = `<table><thead><tr><th>Tender</th><th>Side</th><th>Qty</th><th>Price</th><th>Mid</th><th>Edge</th><th>Cost</th><th>Net/sh</th><th>Exp. $</th><th>Expires</th><th>Bot</th><th></th></tr></thead><tbody>`;
+    for (const t of tv) {
+      const fixed = t.kind === "fixed";
+      const cls = t.decision === "PASS" ? "" : fixed ? "good" : "serious";
+      const left = t.expires - (s.tick || 0);
+      h += `<tr><td>${t.id} <span class="mkt">${t.ticker}${fixed ? "" : " · " + t.kind}</span></td><td>${t.side}</td><td>${t.qty.toLocaleString()}</td>
+        <td>${fmtN(t.price)}${fixed ? "" : " <span class='mkt'>bid</span>"}</td><td>${fmtN(t.mid)}</td><td>${fmtN(t.edge, 3)}</td><td>${fmtN(t.cost, 3)}</td>
+        <td><b>${fmtN(t.net, 3)}</b></td><td>${fixed ? fmt$(t.net * t.qty) : "-"}</td><td>${left > 0 ? left + " ticks" : "now"}</td>
+        <td><span class="badge ${cls}">${t.decision}</span></td>
+        <td><button class="small" onclick="control({action:'accept', id:${t.id}})">${fixed ? "Accept" : "Bid " + fmtN(t.price)}</button>
+            <button class="small" onclick="control({action:'decline', id:${t.id}})">Decline</button></td></tr>`;
+    }
+    $("tenders").innerHTML = h + "</tbody></table>";
+  }
+
+  // positions
+  const ps = s.stocks || [];
+  if (!ps.length) $("positions").innerHTML = `<div class="empty">Waiting for market data.</div>`;
+  else {
+    let h = `<table><thead><tr><th>Stock</th><th>Position</th><th>Mid</th><th>Vol/tick</th><th>Markets (bid / ask · position)</th></tr></thead><tbody>`;
+    for (const p of ps) {
+      const m = p.markets.map(k => `${k.ticker} ${fmtN(k.bid)} / ${fmtN(k.ask)} · ${signed(k.position)}`).join("<br>");
+      h += `<tr><td><b>${p.name}</b></td><td><b>${signed(p.position)}</b></td><td>${fmtN(p.mid)}</td><td>${fmtN(p.vol, 2)}%</td><td class="mkt">${m}</td></tr>`;
+    }
+    $("positions").innerHTML = h + "</tbody></table>";
+  }
+
+  // log
+  const lg = $("log"), atBottom = lg.scrollTop + lg.clientHeight >= lg.scrollHeight - 20;
+  lg.textContent = (s.log || []).join("\n");
+  if (atBottom) lg.scrollTop = lg.scrollHeight;
+}
+
+async function poll() {
+  try {
+    const r = await fetch("/api/state", { cache: "no-store" });
+    render(await r.json());
+  } catch (e) {
+    setPill("connDot", "conn", "bot not running", "critical");
+  }
+}
+setInterval(poll, 500); poll();
+addEventListener("resize", () => S && drawChart(S));
+</script>
+</body>
+</html>
+"""
+
+
 if __name__ == "__main__":
     bot = Bot(parse_args())
+    if bot.cfg.dash_port:
+        start_dashboard(bot)
 
     def bye(*_):
-        print("\nStopping - cancelling open orders.")
+        log("Stopping - cancelling open orders.")
         try:
             if not bot.cfg.dry_run:
                 bot.api.post("/commands/cancel", all=1)
