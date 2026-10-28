@@ -38,7 +38,17 @@ you pass explicitly overrides the preset.
   into the winners' selling. Set `--crowd-size 0` to turn it off.
 - **Cross-market arbitrage:** when one market's bid is above the other market's ask by more than both
   fees combined, the bot buys on one market and sells on the other (only rounds 5-6 have two markets).
+- **Fade (opt-in, `--fade-size 10000`):** when the price moves more than `fade_z` (default 3)
+  standard deviations in 5 ticks, the bot bets on it moving back and exits about 6 ticks later. It's based on
+  the anonymous order flow pulling the price back to its path. It's **off by default**: in the offline test it
+  lost about $20k when it fired on ordinary random noise. Only turn it on if you see sharp spikes snapping back in a round.
 - **Front-loaded unwind** (`front_load`): sells more in the first ticks of an unwind, so the bot reaches the order book before other traders.
+
+**Passive unwinding (all rounds, on by default):** while the bot is on schedule, it also rests a
+5,000-share order at the best price on whichever market pays the most for providing liquidity (the
+alternative market's 0.5¢ rebate). That earns the spread instead of paying it. Any order that goes stale is
+re-quoted. Resting and new orders together can never exceed the position, so it can't overshoot into fines.
+Turn it off with `--passive`.
 
 Main tuning knobs:
 - `--min-edge`: profit per share still required after costs. Raise it to accept fewer tenders.

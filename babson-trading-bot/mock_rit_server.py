@@ -10,17 +10,22 @@ rebuilt around it every tick and depressed by net order flow, fixed tenders and 
 """
 import json
 import random
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-TICK_SECONDS, TPP = 0.1, 300
-random.seed(7)
+TICK_SECONDS = float(sys.argv[2]) if len(sys.argv) > 2 else 0.1
+TPP = 300
+SEED = int(sys.argv[1]) if len(sys.argv) > 1 else 7
+path_rng = random.Random(SEED)          # price path + tenders: identical for every bot version
+book_rng = random.Random(SEED + 1000)   # book shapes
+fill_rng = random.Random(SEED + 2000)   # ANON hits on resting orders
 lock = threading.Lock()
 S = {
     "tick": 0, "true": {"CRZY": 10.0, "TAME": 25.0}, "pressure": {"CRZY": 0.0, "TAME": 0.0},
-    "pos": {}, "cash": 0.0, "books": {}, "orders": {}, "next_id": 1, "tenders": {}, "trades": 0,
+    "pos": {}, "cash": 0.0, "books": {}, "orders": {}, "next_id": 1, "tenders": {}, "trades": 0, "resting": {},
 }
 TICKERS = ["CRZY_M", "CRZY_A", "TAME_M", "TAME_A"]
 FEE = {"_M": 0.02, "_A": 0.01}
@@ -36,14 +41,14 @@ def rebuild_books():
     for t in TICKERS:
         u = und(t)
         alt = t.endswith("_A")
-        mid = S["true"][u] + S["pressure"][u] + (random.uniform(-0.02, 0.02) if alt else 0)
-        if alt and random.random() < 0.05:  # occasional cross-market dislocation
-            mid += random.choice([-0.05, 0.05])
+        mid = S["true"][u] + S["pressure"][u] + (book_rng.uniform(-0.02, 0.02) if alt else 0)
+        if alt and book_rng.random() < 0.05:  # occasional cross-market dislocation
+            mid += book_rng.choice([-0.05, 0.05])
         mid = round(mid, 2)
         S["books"][t] = {
-            "bids": [{"price": round(mid - 0.01 * k, 2), "quantity": random.randint(2, 6) * 1000,
+            "bids": [{"price": round(mid - 0.01 * k, 2), "quantity": book_rng.randint(2, 6) * 1000,
                       "quantity_filled": 0, "trader_id": "ANON"} for k in range(1, 30)],
-            "asks": [{"price": round(mid + 0.01 * k, 2), "quantity": random.randint(2, 6) * 1000,
+            "asks": [{"price": round(mid + 0.01 * k, 2), "quantity": book_rng.randint(2, 6) * 1000,
                       "quantity_filled": 0, "trader_id": "ANON"} for k in range(1, 30)],
         }
 
@@ -67,24 +72,54 @@ def fill(ticker, action, qty, limit):
     return done
 
 
+def rest(ticker, action, qty, price):
+    oid = S["next_id"]
+    S["next_id"] += 1
+    S["resting"][oid] = {"order_id": oid, "ticker": ticker, "action": action, "quantity": qty,
+                         "quantity_filled": 0, "price": price, "type": "LIMIT", "tick": S["tick"]}
+    return oid
+
+
+def match_resting():
+    """Resting orders fill if the new book crosses them, or sometimes when an ANON order hits the touch."""
+    for oid, o in list(S["resting"].items()):
+        t, left = o["ticker"], o["quantity"] - o["quantity_filled"]
+        b = S["books"][t]
+        best_opp = b["bids"][0]["price"] if o["action"] == "SELL" else b["asks"][0]["price"]
+        best_same = b["asks"][0]["price"] if o["action"] == "SELL" else b["bids"][0]["price"]
+        crossed = best_opp >= o["price"] if o["action"] == "SELL" else best_opp <= o["price"]
+        at_touch = o["price"] <= best_same if o["action"] == "SELL" else o["price"] >= best_same
+        q = left if crossed else (min(left, fill_rng.randint(1, 4) * 1000) if at_touch and fill_rng.random() < 0.35 else 0)
+        if q:
+            sign = 1 if o["action"] == "BUY" else -1
+            maker = -0.005 if t.endswith("_A") else FEE["_M"]
+            S["pos"][t] += sign * q
+            S["cash"] -= sign * q * o["price"] + q * maker
+            S["trades"] += q
+            o["quantity_filled"] += q
+        if o["quantity_filled"] >= o["quantity"]:
+            del S["resting"][oid]
+
+
 def clock():
     while S["tick"] < TPP:
         time.sleep(TICK_SECONDS)
         with lock:
             S["tick"] += 1
             for u in S["true"]:
-                S["true"][u] *= 1 + random.gauss(0, 0.003)
+                S["true"][u] *= 1 + path_rng.gauss(0, 0.003)
                 S["pressure"][u] *= 0.92
             rebuild_books()
+            match_resting()
             tk = S["tick"]
             if tk % 50 == 10:  # fixed tender
-                u = random.choice(["CRZY", "TAME"])
-                act = random.choice(["BUY", "SELL"])
-                spread = random.choice([0.03, 0.12, 0.25, 0.30])
+                u = path_rng.choice(["CRZY", "TAME"])
+                act = path_rng.choice(["BUY", "SELL"])
+                spread = path_rng.choice([0.03, 0.12, 0.25, 0.30])
                 mid = S["true"][u]
                 S["tenders"][tk] = {"tender_id": tk, "period": 1, "tick": tk, "expires": tk + 15,
                                     "caption": f"An institution would like to {'SELL' if act == 'BUY' else 'BUY'}",
-                                    "quantity": random.choice([40000, 60000, 80000]), "action": act,
+                                    "quantity": path_rng.choice([40000, 60000, 80000]), "action": act,
                                     "is_fixed_bid": True, "price": round(mid - spread if act == "BUY" else mid + spread, 2),
                                     "ticker": u + "_M", "reserve": None}
             if tk in (120, 230):  # auctions
@@ -145,11 +180,19 @@ class H(BaseHTTPRequestHandler):
                 n = int(q.get("limit", 20))
                 return self.reply({"bids": b["bids"][:n], "asks": b["asks"][:n]})
             if p == "/v1/orders" and method == "GET":
-                return self.reply([])  # every order is IOC in the mock
+                return self.reply(list(S["resting"].values()))
             if p == "/v1/orders" and method == "POST":
-                done = fill(q["ticker"], q["action"], int(q["quantity"]), float(q["price"]))
-                return self.reply({"order_id": 1, "quantity_filled": done})
+                qty, px = int(q["quantity"]), float(q["price"])
+                done = fill(q["ticker"], q["action"], qty, px)
+                oid = rest(q["ticker"], q["action"], qty, px) if done < qty else 0
+                if oid:
+                    S["resting"][oid]["quantity_filled"] = done
+                return self.reply({"order_id": oid, "quantity_filled": done})
+            if p.startswith("/v1/orders/") and method == "DELETE":
+                S["resting"].pop(int(p.rsplit("/", 1)[1]), None)
+                return self.reply({"success": True})
             if p == "/v1/commands/cancel":
+                S["resting"].clear()
                 return self.reply({"cancelled_order_ids": []})
             if p == "/v1/tenders":
                 return self.reply([{k: v for k, v in t.items() if k != "reserve"} for t in S["tenders"].values()])

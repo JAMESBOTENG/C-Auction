@@ -68,6 +68,10 @@ class Config:
     net_across_markets: bool = True   # treat CRZY_M and CRZY_A as one inventory (see README)
     book_depth: int = 50
     front_load: float = 1.0           # >1 unwinds faster early on (beat other traders to the book)
+    passive: bool = True              # while on schedule, also rest an order at the touch (earn spread + rebate)
+    passive_qty: int = 5000           # size of that resting order
+    passive_ttl: int = 3              # ticks before a resting order is cancelled and re-quoted
+    passive_share: float = 0.5        # cut the aggressive slice by this much while a resting order works
 
     # --- rounds 5-8 (no fines): speculative edges, all off unless no_fines ------------------
     round: int = 0                    # 1-8 applies the ROUND_PRESETS below
@@ -78,6 +82,10 @@ class Config:
     arb: bool = True                  # cross-market arbitrage _M vs _A when prices cross after fees
     arb_min: float = 0.005            # $/share profit after both fees
     arb_max_qty: int = 5000
+    fade_size: int = 0                # fade abnormal price jumps (participant flow that tends to revert)
+    fade_z: float = 3.0               # ...when the last fade_lookback-tick move exceeds this many sd
+    fade_lookback: int = 5
+    fade_hold: int = 6                # ticks to hold before the normal unwind closes it
 
 
 # Explicit command-line flags always win over these.
@@ -194,6 +202,10 @@ class Bot:
         self.crowd_pos = {}                # und -> signed shares of the crowd pre-position
         self.hold_until = {}               # und -> tick until which unwind leaves the position alone
         self.arb_tick = {}
+        self.passive_ids = {}              # order_id -> (und, tick placed)
+        self.passive_open = defaultdict(int)
+        self.fade_block = {}
+        self.busy = set()                  # unds with a live tender/auction (don't fade them)
 
     # ---------------------------------------------------------------- market data
     def snapshot(self, case):
@@ -320,6 +332,7 @@ class Bot:
 
     def handle_tenders(self, tick):
         tenders = self.api.get("/tenders") or []
+        self.busy = {self.key(t["ticker"]) for t in tenders if t["ticker"] in self.secs}
         for t in tenders:
             tid = t["tender_id"]
             ticker = t["ticker"]
@@ -422,6 +435,37 @@ class Bot:
                         self.send(b, "SELL", q, bid)
                         self.arb_tick[und] = tick
 
+    def fade(self, tick):
+        """No-fines rounds: a move far bigger than normal over a few ticks is usually another trader
+        dumping a block; ANON flow pulls the price back toward its path, so lean against it briefly."""
+        if not (self.cfg.no_fines and self.cfg.fade_size):
+            return
+        k = self.cfg.fade_lookback
+        for und in self.und_tickers:
+            h = self.mids[und]
+            if (self.position(und) != 0 or und in self.busy or tick < self.fade_block.get(und, -1)
+                    or len(h) < k + 20 or self.cfg.endgame_ticks + self.cfg.fade_hold + 5 > self.ticks_left):
+                continue
+            move = math.log(h[-1] / h[-1 - k])
+            sd = self.tick_vol(und) * math.sqrt(k)
+            if abs(move) < self.cfg.fade_z * sd:
+                continue
+            side = "BUY" if move < 0 else "SELL"
+            lv = self.levels(und, side)
+            if not lv:
+                continue
+            limit_net = lv[0].net - self.cfg.max_slippage / 2 if side == "SELL" else lv[0].net + self.cfg.max_slippage / 2
+            _, filled, per_ticker = walk(lv, self.cfg.fade_size, side, limit_net)
+            if not filled:
+                continue
+            print(f"[t{tick}] FADE {side} {filled:,} {und}: {move * 100:+.2f}% in {k} ticks ({abs(move) / sd:.1f} sd)",
+                  flush=True)
+            for t, (q, worst_raw) in per_ticker.items():
+                self.send(t, side, q, worst_raw)
+            self.hold_until[und] = tick + self.cfg.fade_hold
+            self.acquired_tick[und] = tick + self.cfg.fade_hold
+            self.fade_block[und] = tick + self.cfg.fade_hold + 15
+
     # ---------------------------------------------------------------- unwinding
     def unwind(self, case):
         tick, tpp = case["tick"], case["ticks_per_period"]
@@ -437,16 +481,23 @@ class Bot:
             if self.slices[(und, tick)] >= self.cfg.orders_per_tick and ticks_left > self.cfg.endgame_ticks:
                 continue
 
-            remaining = abs(pos)
             held = tick - self.acquired_tick[und]
             endgame = ticks_left <= self.cfg.endgame_ticks
+            side = "SELL" if pos > 0 else "BUY"
+            resting = self.passive_open.get(und, 0)
+            if (self.cfg.passive and not endgame and held < self.cfg.unwind_ticks and resting == 0
+                    and abs(pos) > self.cfg.passive_qty):
+                resting = self.place_passive(und, side, self.cfg.passive_qty, tick)
+            remaining = abs(pos) - resting          # never let resting + new orders exceed the position
+            if remaining <= 0:
+                continue
             sched_left = max(1, self.cfg.unwind_ticks - held)
             per_tick = remaining if endgame else math.ceil(remaining / sched_left * self.cfg.front_load)
             qty = min(remaining, math.ceil(per_tick / self.cfg.orders_per_tick))
             if held > self.cfg.unwind_ticks:  # behind schedule -> speed up
                 qty = min(remaining, qty * 2)
-
-            side = "SELL" if pos > 0 else "BUY"
+            elif resting and not endgame:     # the resting order is doing part of the work
+                qty = max(1, int(qty * (1 - self.cfg.passive_share)))
             lv = self.levels(und, side)
             if not lv:
                 continue
@@ -470,11 +521,61 @@ class Bot:
                               price=round(price, 2))
             qty -= q
 
-    def cancel_leftovers(self):
+    def manage_orders(self, tick):
+        """Cancel leftovers of aggressive orders and stale resting orders; keep resting unwind orders
+        that are young, on the right side and still at the best price."""
+        self.passive_open = defaultdict(int)
         if self.cfg.dry_run:
             return
-        if self.api.get("/orders", status="OPEN"):
-            self.api.post("/commands/cancel", all=1)
+        for o in self.api.get("/orders", status="OPEN") or []:
+            oid, t = o["order_id"], o["ticker"]
+            info = self.passive_ids.get(oid)
+            keep = False
+            if info and t in self.secs:
+                und, placed = info
+                pos = self.position(und)
+                sec = self.secs[t]
+                right_side = (pos > 0 and o["action"] == "SELL") or (pos < 0 and o["action"] == "BUY")
+                at_touch = (o["price"] <= (sec.get("ask") or 0) + 1e-9 if o["action"] == "SELL"
+                            else o["price"] >= (sec.get("bid") or 1e9) - 1e-9)
+                keep = right_side and at_touch and tick - placed < self.cfg.passive_ttl
+            if keep:
+                self.passive_open[und] += int(o["quantity"] - o.get("quantity_filled", 0))
+            else:
+                try:
+                    self.api.delete(f"/orders/{oid}")
+                except RuntimeError:
+                    pass  # already filled / gone
+                self.passive_ids.pop(oid, None)
+
+    def place_passive(self, und, side, qty, tick):
+        """Rest an order at the touch on the venue that pays best for providing liquidity."""
+        best = None
+        for t in self.und_tickers[und]:
+            sec = self.secs[t]
+            bid, ask = sec.get("bid"), sec.get("ask")
+            if not bid or not ask:
+                continue
+            rebate = float(sec.get("limit_order_rebate") or 0)
+            maker_cost = -rebate if rebate > 0 else take_fee(sec)
+            if side == "SELL":
+                px = ask - 0.01 if ask - bid >= 0.03 else ask   # step inside a wide spread to be first
+                val = px - maker_cost
+            else:
+                px = bid + 0.01 if ask - bid >= 0.03 else bid
+                val = -(px + maker_cost)
+            if best is None or val > best[0]:
+                best = (val, t, px)
+        if not best:
+            return 0
+        _, t, px = best
+        if self.cfg.dry_run:
+            print(f"    (dry) passive {side} {qty} {t} @ {px:.2f}")
+            return qty
+        o = self.api.post("/orders", ticker=t, type="LIMIT", quantity=qty, action=side, price=round(px, 2))
+        if o and "order_id" in o:
+            self.passive_ids[o["order_id"]] = (und, tick)
+        return qty
 
     # ---------------------------------------------------------------- main loop
     def run(self):
@@ -494,13 +595,15 @@ class Bot:
                     self.reset_period_state()
                     print(f"=== period {self.period} ===", flush=True)
                 tick = case["tick"]
-                self.cancel_leftovers()            # leftovers first, so positions below are final
+                self.ticks_left = case["ticks_per_period"] - tick
                 self.snapshot(case)
+                self.manage_orders(tick)
                 self.record_mids(tick)
                 self.handle_tenders(tick)
                 self.snapshot(case)                # refresh positions after any accepted tender
                 self.unwind(case)
                 self.arbitrage(tick)
+                self.fade(tick)
                 if tick != last_status_tick and tick % 10 == 0:
                     last_status_tick = tick
                     nlv = self.api.get("/trader").get("nlv", 0)
