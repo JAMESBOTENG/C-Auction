@@ -32,6 +32,11 @@ When the bot starts, it opens **http://localhost:8050** in your browser. The pag
 
 `--dash-port 0` turns the dashboard off. `--no-browser` stops it opening automatically.
 
+## Log file
+Every run writes `bot_log_<date>_<time>.txt` next to the bot. It includes RIT's real fees and limits at the
+start of each round, positions per market every 10 ticks, every decision, and an end-of-round summary.
+Send this file when a round goes wrong.
+
 ## Stance (aggression dial) and safety nets
 The dashboard's **Stance** card has a single 0-100 aggression dial: Cautious, Balanced, Aggressive, Max.
 The default is 30. More aggressive takes more tenders and sells faster. In the offline benchmark it did
@@ -49,14 +54,15 @@ Safety nets (on by default):
   auto-accept off and pauses. Press Resume to continue.
 
 ## Check this first on the practice server: are the two markets netted?
-The bot treats `CRZY_M` and `CRZY_A` as **one inventory**. It may buy a tender on `_M` and sell part of it
+With `--net-across-markets`, the bot treats `CRZY_M` and `CRZY_A` as **one inventory**. It may buy a tender on `_M` and sell part of it
 on `_A` when `_A` is cheaper, which can leave e.g. `CRZY_M +30,000 / CRZY_A -30,000`.
 On the practice server, accept a tender, let the bot unwind, then look at the Portfolio and
 Trading Limits windows:
 - If the **net** limit and the fines treat the stock as flat, you're fine (this is the intent of the case:
   "distribute your trades between the two markets").
-- If they don't, run with `--net-across-markets`. That flag switches netting **off**, so each
-  ticker unwinds only on its own market.
+- **Netting is now OFF by default:** each ticker is sold off only on its own market, which is safe either
+  way. If you confirm that RIT nets the two markets, run with `--net-across-markets` to use both markets
+  (better prices and the alternative market's lower fee).
 
 ## Settings by round: use `--round N`
 `python rit_liability_bot.py --api-key YOURKEY --round 6` loads the preset for that round. Any flag

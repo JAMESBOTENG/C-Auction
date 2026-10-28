@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import math
 import queue
 import signal
@@ -73,13 +74,15 @@ class Config:
     orders_per_tick: int = 2          # unwind slices per tick per stock
     max_slippage: float = 0.05        # per slice, never walk the book more than this past the best price
     endgame_ticks: int = 12           # with this few ticks left in the period, flatten everything
-    net_across_markets: bool = True   # treat CRZY_M and CRZY_A as one inventory (see README)
+    net_across_markets: bool = False  # True = treat CRZY_M and CRZY_A as ONE inventory. Only turn on once you've
+                                      # confirmed RIT nets them; if it doesn't, both legs get fined (see README)
     book_depth: int = 50
 
     # --- safety nets -------------------------------------------------------------------------
     max_position: int = 150_000       # never accept a tender that takes one stock past this many shares
     loss_limit: float = 100_000       # round loss that trips the circuit breaker: flatten + pause (0 = off)
     stuck_ticks: int = 8              # position not shrinking for this long -> sell it aggressively
+    late_penalty: bool = False        # charge late tenders for the rushed end-of-round unwind
     front_load: float = 1.0           # >1 unwinds faster early on (beat other traders to the book)
     passive: bool = True              # while on schedule, also rest an order at the touch (earn spread + rebate)
     passive_qty: int = 5000           # size of that resting order
@@ -229,10 +232,20 @@ def walk(levels: list[Level], qty: int, side: str, limit_net: float | None = Non
 LOG = deque(maxlen=400)  # recent console lines, also shown on the dashboard
 
 
+LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        time.strftime("bot_log_%Y%m%d_%H%M%S.txt"))
+
+
 def log(*parts, **_):
     msg = " ".join(str(x) for x in parts)
-    LOG.append(time.strftime("%H:%M:%S ") + msg.strip("\n"))
+    line = time.strftime("%H:%M:%S ") + msg.strip("\n")
+    LOG.append(line)
     print(msg, flush=True)
+    try:  # keep a full copy on disk so a bad round can be investigated afterwards
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
 
 
 # Settings the dashboard may change while the bot runs.
@@ -388,6 +401,10 @@ class Bot:
         d_cost = self.liquidation_cost(und, new, mid) - self.liquidation_cost(und, pos, mid)
         d_risk = self.inventory_risk(und, new, mid) - self.inventory_risk(und, pos, mid)
         q = abs(signed_qty)
+        # Late in the round there is no time for a normal unwind: the end-of-round dump is far costlier.
+        room = getattr(self, "ticks_left", 10_000) - self.cfg.endgame_ticks
+        if self.cfg.late_penalty:
+            impact_mult *= max(1.0, self.cfg.unwind_ticks / max(1, room))
         self.last_impact = self.cfg.impact_weight * impact_mult * d_cost / q
         need = (self.cfg.impact_weight * impact_mult * d_cost + self.cfg.risk_aversion * d_risk) / q
         return mid, need
@@ -765,13 +782,19 @@ class Bot:
                 # rounds): also treat the tick going backwards or a new case name as a new round.
                 restarted = self.last_tick is not None and tick < self.last_tick
                 if case["period"] != self.period or restarted or case.get("name") != self.case_name:
+                    if self.period is not None:
+                        self.round_summary(nlv)
                     self.period, self.case_name = case["period"], case.get("name")
                     self.reset_period_state()
+                    self.settings_logged = False
                     self.breaker = False
                     log(f"=== new round: {case.get('name', '')} period {self.period} (tick {tick}) ===")
                 self.last_tick = tick
                 self.ticks_left = case["ticks_per_period"] - tick
                 self.snapshot(case)
+                if not getattr(self, "settings_logged", False):
+                    self.settings_logged = True
+                    self.log_market_setup()
                 if not self.paused:
                     self.manage_orders(tick)
                 self.record_mids(tick)
@@ -796,7 +819,7 @@ class Bot:
                     self.check_breaker(tick, nlv)
                 if tick != last_status_tick and tick % 10 == 0:
                     last_status_tick = tick
-                    pos = ", ".join(f"{u}:{self.position(u):+,}" for u in self.und_tickers)
+                    pos = ", ".join(f"{t}:{int(sec.get('position', 0)):+,}" for t, sec in self.secs.items())
                     log(f"[t{tick}/{case['ticks_per_period']}] NLV ${nlv:,.0f} | {pos}")
                 self.publish_state(case, nlv, connected=True)
             except requests.exceptions.ConnectionError:
@@ -812,6 +835,28 @@ class Bot:
                 log(self.last_error)
                 traceback.print_exc()
             time.sleep(self.cfg.loop_sleep)
+
+    def log_market_setup(self):
+        """Record what RIT actually reports (fees, sizes, limits) - the bot's assumptions get checked against this."""
+        for t, sec in self.secs.items():
+            log(f"  market {t}: fee {sec.get('trading_fee')} rebate {sec.get('limit_order_rebate')} "
+                f"max order {sec.get('max_trade_size')} position {sec.get('position')} last {sec.get('last')}")
+        try:
+            for lim in self.api.get("/limits") or []:
+                log(f"  limit {lim.get('name')}: gross {lim.get('gross')}/{lim.get('gross_limit')} "
+                    f"net {lim.get('net')}/{lim.get('net_limit')} fines {lim.get('gross_fine')}/{lim.get('net_fine')}")
+        except RuntimeError as e:
+            log("  limits unavailable:", e)
+        log(f"  netting across markets: {'ON' if self.cfg.net_across_markets else 'OFF'} | "
+            f"stance {stance_name(self.cfg.aggression)} {self.cfg.aggression} | min edge {self.cfg.min_edge}")
+
+    def round_summary(self, nlv):
+        log(f"=== round summary: NLV ${nlv:,.0f} (start ${self.round_start_nlv or 0:,.0f}) ===")
+        for r in self.scorecard:
+            log(f"  tender {r['id']} {r['side']} {r['qty']:,} {r['ticker']} @ {r['price']}: expected "
+                f"${r['expected']:,.0f}, actual ${r['actual'] or 0:,.0f} [{r['status']}{', approx' if r['approx'] else ''}]")
+        left = {t: sec.get("position", 0) for t, sec in getattr(self, "secs", {}).items() if sec.get("position")}
+        log(f"  positions left at end: {left or 'none'}")
 
     def check_breaker(self, tick, nlv):
         loss = self.round_start_nlv - nlv
