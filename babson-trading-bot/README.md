@@ -32,6 +32,22 @@ When the bot starts, it opens **http://localhost:8050** in your browser. The pag
 
 `--dash-port 0` turns the dashboard off. `--no-browser` stops it opening automatically.
 
+## Stance (aggression dial) and safety nets
+The dashboard's **Stance** card has a single 0-100 aggression dial: Cautious, Balanced, Aggressive, Max.
+The default is 30. More aggressive takes more tenders and sells faster. In the offline benchmark it did
+**not** make more money (15: $63k, 40: $57k, 70: $47k, 95: $42k per round on average), so let the
+**Tender results** card guide you. It compares each tender's expected and actual profit, and tells you to
+move the dial up or down. Start the bot at a given stance with `--aggression 50`.
+
+Safety nets (on by default):
+- **New-round detection:** the practice server can start a new round without changing the period
+  number. The bot now also resets when the tick goes backwards. Before this fix, stale state from the
+  previous round stopped it from unwinding, and positions piled up.
+- **Watchdog:** a position that hasn't shrunk for 8 ticks is sold aggressively.
+- **Position cap:** no tender is accepted if it would take one stock past 150,000 shares (`--max-position`).
+- **Circuit breaker:** if the round loss passes $100,000 (`--loss-limit`), the bot closes everything, turns
+  auto-accept off and pauses. Press Resume to continue.
+
 ## Check this first on the practice server: are the two markets netted?
 The bot treats `CRZY_M` and `CRZY_A` as **one inventory**. It may buy a tender on `_M` and sell part of it
 on `_A` when `_A` is cheaper, which can leave e.g. `CRZY_M +30,000 / CRZY_A -30,000`.

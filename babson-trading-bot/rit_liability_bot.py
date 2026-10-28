@@ -75,6 +75,11 @@ class Config:
     endgame_ticks: int = 12           # with this few ticks left in the period, flatten everything
     net_across_markets: bool = True   # treat CRZY_M and CRZY_A as one inventory (see README)
     book_depth: int = 50
+
+    # --- safety nets -------------------------------------------------------------------------
+    max_position: int = 150_000       # never accept a tender that takes one stock past this many shares
+    loss_limit: float = 100_000       # round loss that trips the circuit breaker: flatten + pause (0 = off)
+    stuck_ticks: int = 8              # position not shrinking for this long -> sell it aggressively
     front_load: float = 1.0           # >1 unwinds faster early on (beat other traders to the book)
     passive: bool = True              # while on schedule, also rest an order at the touch (earn spread + rebate)
     passive_qty: int = 5000           # size of that resting order
@@ -83,6 +88,7 @@ class Config:
 
     # --- rounds 5-8 (no fines): speculative edges, all off unless no_fines ------------------
     round: int = 0                    # 1-8 applies the ROUND_PRESETS below
+    aggression: int = 30              # 0 = very cautious ... 100 = maximum (see AGGRESSION_ANCHORS)
     no_fines: bool = False
     crowd_size: int = 25000           # competitive auctions: pre-position ahead of the winners' unwind
     crowd_ticks: int = 6              # ...starting this many ticks before the auction closes
@@ -107,6 +113,39 @@ ROUND_PRESETS = {
     7: {"no_fines": True, "front_load": 1.3, "min_edge": 0.05, "risk_aversion": 0.8},
     8: {"no_fines": True, "front_load": 1.5, "min_edge": 0.05, "risk_aversion": 0.8},
 }
+
+
+# One dial for the dashboard. Each row: aggression, min_edge, risk_aversion, impact_weight,
+# unwind_ticks, wta_extra_edge, comp_extra_edge. Values in between are interpolated linearly.
+AGGRESSION_ANCHORS = [
+    (0, 0.080, 1.00, 0.90, 26, 0.070, 0.100),
+    (40, 0.030, 0.50, 0.60, 18, 0.030, 0.050),   # the original defaults
+    (70, 0.015, 0.30, 0.45, 14, 0.015, 0.030),
+    (100, 0.000, 0.10, 0.30, 10, 0.000, 0.010),
+]
+AGGRESSION_KEYS = ("min_edge", "risk_aversion", "impact_weight", "unwind_ticks", "wta_extra_edge", "comp_extra_edge")
+
+
+def aggression_params(aggression: float, rnd: int) -> dict:
+    """Strategy numbers for an aggression level, shifted by the round preset (e.g. pickier in round 7)."""
+    a = max(0.0, min(100.0, float(aggression)))
+    for lo, hi in zip(AGGRESSION_ANCHORS, AGGRESSION_ANCHORS[1:]):
+        if lo[0] <= a <= hi[0]:
+            f = (a - lo[0]) / (hi[0] - lo[0])
+            vals = [lo[i] + (hi[i] - lo[i]) * f for i in range(1, len(lo))]
+            break
+    out = dict(zip(AGGRESSION_KEYS, vals))
+    base = Config()
+    for k, v in ROUND_PRESETS.get(rnd, {}).items():
+        if k in out:
+            out[k] += v - getattr(base, k)
+    out["unwind_ticks"] = max(6, int(round(out["unwind_ticks"])))
+    return {k: (v if k == "unwind_ticks" else round(max(0.0, v), 4)) for k, v in out.items()}
+
+
+def stance_name(aggression: float) -> str:
+    return ("Cautious" if aggression < 25 else "Balanced" if aggression < 55
+            else "Aggressive" if aggression < 80 else "Max aggressive")
 
 
 # --------------------------------------------------------------------------------------------------
@@ -197,7 +236,7 @@ def log(*parts, **_):
 
 
 # Settings the dashboard may change while the bot runs.
-TUNABLE = ["min_edge", "risk_aversion", "impact_weight", "unwind_ticks", "front_load", "max_slippage",
+TUNABLE = ["max_position", "loss_limit", "min_edge", "risk_aversion", "impact_weight", "unwind_ticks", "front_load", "max_slippage",
            "passive", "passive_qty", "no_fines", "crowd_size", "arb", "fade_size", "fade_z",
            "wta_extra_edge", "comp_extra_edge"]
 
@@ -218,7 +257,10 @@ class Bot:
         self.commands = queue.Queue()
         self.state = {"connected": False, "log": []}
         self.last_error = ""
-        self.easy_levels = {"tenders": "normal", "speed": "normal", "auctions": "normal"}
+        self.last_nlv = 0.0
+        self.last_tick = None
+        self.case_name = None
+        self.breaker = False
         self.reset_period_state()
 
     def reset_period_state(self):
@@ -240,6 +282,11 @@ class Bot:
         self.nlv_hist = []                 # [tick, nlv] for the dashboard chart
         self.tender_view = {}              # tender_id -> what the dashboard shows
         self.stats = {"accepted": 0, "expected": 0.0, "auctions": 0}
+        self.scorecard = []                # accepted tenders: expected vs actual P&L
+        self.progress = {}                 # und -> (smallest |position| seen, tick it was seen)
+        self.stuck_logged = set()
+        self.round_start_nlv = None
+        self.progress_sign = {}
 
     # ---------------------------------------------------------------- market data
     def snapshot(self, case):
@@ -341,6 +388,7 @@ class Bot:
         d_cost = self.liquidation_cost(und, new, mid) - self.liquidation_cost(und, pos, mid)
         d_risk = self.inventory_risk(und, new, mid) - self.inventory_risk(und, pos, mid)
         q = abs(signed_qty)
+        self.last_impact = self.cfg.impact_weight * impact_mult * d_cost / q
         need = (self.cfg.impact_weight * impact_mult * d_cost + self.cfg.risk_aversion * d_risk) / q
         return mid, need
 
@@ -392,14 +440,16 @@ class Bot:
                 net_edge = edge - need
                 tag = (f"[t{tick}] TENDER {tid} {'BUY' if we_buy else 'SELL'} {q:,} {ticker} @ {price:.2f} "
                        f"| mid {mid:.2f} edge {edge:+.3f} cost {need:.3f} -> net {net_edge:+.3f}/sh")
-                good = net_edge >= self.cfg.min_edge
+                capped = abs(self.position(und) + signed) > self.cfg.max_position
+                good = net_edge >= self.cfg.min_edge and not capped
                 self.tender_view[tid] = dict(id=tid, kind="fixed", side="BUY" if we_buy else "SELL", qty=q,
                                              ticker=ticker, price=price, mid=mid, edge=edge, cost=need,
-                                             net=net_edge, expires=expires,
-                                             decision="WOULD ACCEPT" if good else "PASS")
+                                             net=net_edge, expires=expires, exp_profit=(edge - self.last_impact) * q,
+                                             decision="PASS (position cap)" if capped else
+                                             "WOULD ACCEPT" if good else "PASS")
                 if good and act and self.within_limits(signed):
-                    log(tag + f"  ACCEPT (exp. ${net_edge * q:,.0f})")
-                    self.accept_tender(tid, und, tick, expected=net_edge * q)
+                    log(tag + f"  ACCEPT (exp. ${(edge - self.last_impact) * q:,.0f})")
+                    self.accept_tender(tid, und, tick, expected=(edge - self.last_impact) * q)
                 elif good and not act:
                     self.log_tender(tid, tag + "  would ACCEPT - auto-accept is off (use the dashboard)")
                 else:
@@ -429,7 +479,7 @@ class Bot:
                         self.log_tender(tid, f"AUCTION {tid} {t['action']} {q:,} {ticker} "
                                              f"- will bid at t{expires - self.cfg.auction_submit_before}")
                     continue
-                if not self.within_limits(signed):
+                if not self.within_limits(signed) or abs(self.position(und) + signed) > self.cfg.max_position:
                     log(f"[t{tick}] AUCTION {tid} skipped: would breach position limits")
                 else:
                     log(f"[t{tick}] AUCTION {tid} ({kind}) {'BUY' if we_buy else 'SELL'} {q:,} {ticker} "
@@ -444,8 +494,33 @@ class Bot:
         self.acquired_tick.setdefault(und, tick)
         self.stats["accepted"] += 1
         self.stats["expected"] += expected
+        v = self.tender_view.get(tid, {})
+        others = [r for r in self.scorecard if r["status"] == "unwinding"]
+        for r in others:
+            r["approx"] = True  # P&L is measured from NLV, so overlapping tenders share it
+        self.scorecard.append({"id": tid, "und": und, "side": v.get("side", ""), "qty": v.get("qty", 0),
+                               "ticker": v.get("ticker", und), "price": v.get("price"), "start_tick": tick,
+                               "expected": expected, "nlv_start": self.last_nlv, "actual": None,
+                               "status": "dry run" if self.cfg.dry_run else "unwinding", "approx": bool(others)})
+
+    def update_scorecard(self, tick, nlv):
+        for r in self.scorecard:
+            if r["status"] == "unwinding":
+                r["actual"] = nlv - r["nlv_start"]
+                if tick > r["start_tick"] + 1 and self.position(r["und"]) == 0:
+                    r["status"] = "done"
+                    r["end_tick"] = tick
+                    log(f"[t{tick}] tender {r['id']} closed: expected ${r['expected']:,.0f}, "
+                        f"actual ${r['actual']:,.0f}{' (approx)' if r['approx'] else ''}")
+
+    def mark_overlap(self):
+        """Auctions and crowd trades move NLV too, so tenders unwinding at the same time get an approx flag."""
+        for r in self.scorecard:
+            if r["status"] == "unwinding":
+                r["approx"] = True
 
     def submit_auction(self, tid, price):
+        self.mark_overlap()
         if not self.cfg.dry_run:
             try:
                 self.api.post(f"/tenders/{tid}", price=price)
@@ -472,6 +547,7 @@ class Bot:
         for t, (q, worst_raw) in per_ticker.items():
             self.send(t, side, q, worst_raw)
         self.hold_until[und] = expires + self.cfg.crowd_hold
+        self.mark_overlap()
         self.crowd_pos[und] = filled if side == "BUY" else -filled
 
     def arbitrage(self, tick):
@@ -536,8 +612,28 @@ class Bot:
                 self.acquired_tick.pop(und, None)
                 continue
             self.acquired_tick.setdefault(und, tick)
-            endgame = ticks_left <= self.cfg.endgame_ticks or self.flatten_now
-            if tick <= self.hold_until.get(und, -1) and not endgame:
+            if self.acquired_tick[und] > tick:  # stale (from before a round restart)
+                self.acquired_tick[und] = tick
+            # watchdog: if the position has not changed for stuck_ticks, stop being patient
+            best, since = self.progress.get(und, (None, tick))
+            if best is None or abs(pos) != best or (pos > 0) != self.progress_sign.get(und, pos > 0):
+                best, since = abs(pos), tick
+            self.progress[und] = (best, since)
+            self.progress_sign[und] = pos > 0
+            hold = self.hold_until.get(und, -1)
+            max_hold = max(self.cfg.crowd_hold + self.cfg.crowd_ticks, self.cfg.fade_hold) + 2
+            in_hold = 0 <= hold - tick <= max_hold
+            if in_hold:  # a deliberate hold is not "stuck"
+                self.progress[und] = (abs(pos), tick)
+                since = tick
+            stuck = not in_hold and tick - since >= self.cfg.stuck_ticks
+            if stuck and und not in self.stuck_logged:
+                self.stuck_logged.add(und)
+                log(f"[t{tick}] WATCHDOG {und}: position {pos:+,} not shrinking for {tick - since} ticks - selling aggressively")
+            elif not stuck:
+                self.stuck_logged.discard(und)
+            endgame = ticks_left <= self.cfg.endgame_ticks or self.flatten_now or stuck
+            if in_hold and not endgame:
                 continue
             if self.slices[(und, tick)] >= self.cfg.orders_per_tick and not endgame:
                 continue
@@ -639,7 +735,16 @@ class Bot:
 
     # ---------------------------------------------------------------- main loop
     def run(self):
-        me = self.api.get("/trader")
+        while True:  # wait for RIT instead of crashing if it isn't open / logged in yet
+            try:
+                me = self.api.get("/trader")
+                break
+            except (requests.exceptions.ConnectionError, RuntimeError) as e:
+                self.last_error = "Waiting for RIT - open it, log in, and make sure the API is enabled."
+                log(self.last_error if isinstance(e, requests.exceptions.ConnectionError) else f"API error: {e}")
+                self.publish_state({}, 0, connected=False)
+                time.sleep(3)
+        self.last_error = ""
         self.trader_id = me.get("trader_id")
         log(f"Connected as {self.trader_id}. NLV ${me.get('nlv', 0):,.0f}. "
               f"{'DRY RUN - no orders' if self.cfg.dry_run else 'LIVE'}")
@@ -655,11 +760,16 @@ class Bot:
                     self.publish_state(case, nlv, connected=True)
                     time.sleep(0.5)
                     continue
-                if case["period"] != self.period:
-                    self.period = case["period"]
-                    self.reset_period_state()
-                    log(f"=== period {self.period} ===")
                 tick = case["tick"]
+                # A new round can start without the period changing (the practice server loops
+                # rounds): also treat the tick going backwards or a new case name as a new round.
+                restarted = self.last_tick is not None and tick < self.last_tick
+                if case["period"] != self.period or restarted or case.get("name") != self.case_name:
+                    self.period, self.case_name = case["period"], case.get("name")
+                    self.reset_period_state()
+                    self.breaker = False
+                    log(f"=== new round: {case.get('name', '')} period {self.period} (tick {tick}) ===")
+                self.last_tick = tick
                 self.ticks_left = case["ticks_per_period"] - tick
                 self.snapshot(case)
                 if not self.paused:
@@ -679,6 +789,11 @@ class Bot:
                     last_nlv_tick = tick
                     nlv = self.api.get("/trader").get("nlv", 0)
                     self.nlv_hist.append([tick, round(nlv, 2)])
+                    self.update_scorecard(tick, nlv)
+                    self.last_nlv = nlv
+                    if self.round_start_nlv is None:
+                        self.round_start_nlv = nlv
+                    self.check_breaker(tick, nlv)
                 if tick != last_status_tick and tick % 10 == 0:
                     last_status_tick = tick
                     pos = ", ".join(f"{u}:{self.position(u):+,}" for u in self.und_tickers)
@@ -697,6 +812,18 @@ class Bot:
                 log(self.last_error)
                 traceback.print_exc()
             time.sleep(self.cfg.loop_sleep)
+
+    def check_breaker(self, tick, nlv):
+        loss = self.round_start_nlv - nlv
+        if self.cfg.loss_limit and not self.breaker and loss > self.cfg.loss_limit:
+            self.breaker = True
+            self.auto_tenders = False
+            self.paused = True
+            self.flatten_now = True
+            self.commands.put({"action": "cancel_all"})
+            self.last_error = (f"CIRCUIT BREAKER at t{tick}: round loss ${loss:,.0f} passed ${self.cfg.loss_limit:,.0f}. "
+                               "Closed all positions and paused. Check the log, then Resume if you want to continue.")
+            log(self.last_error)
 
     # ---------------------------------------------------------------- dashboard plumbing
     def process_commands(self):
@@ -720,7 +847,7 @@ class Bot:
                     elif v["kind"] == "fixed":
                         log(f"[dash] manual ACCEPT tender {v['id']} {v['side']} {v['qty']:,} {v['ticker']} @ {v['price']:.2f}")
                         self.accept_tender(v["id"], self.key(v["ticker"]), self.state.get("tick", 0),
-                                           expected=v["net"] * v["qty"])
+                                           expected=v.get("exp_profit", 0.0))
                     else:
                         price = float(cmd.get("price") or v["price"])
                         log(f"[dash] manual auction bid {v['id']} @ {price:.2f}")
@@ -744,6 +871,8 @@ class Bot:
             log("[dash] PAUSED - no new trades, open orders cancelled")
         elif a == "resume":
             self.paused = False
+            if self.breaker:
+                self.last_error = ""
             log("[dash] resumed")
         elif a == "auto_tenders":
             self.auto_tenders = bool(cmd.get("value"))
@@ -756,8 +885,8 @@ class Bot:
             log(f"[dash] mode -> {'DRY RUN' if self.cfg.dry_run else 'LIVE'}")
         elif a == "round":
             self.apply_round(int(cmd["value"]))
-        elif a == "level":
-            return self.set_level(cmd.get("knob"), cmd.get("value"))
+        elif a == "aggression":
+            self.set_aggression(cmd.get("value"))
         elif a == "set":
             key = cmd.get("key")
             if key not in TUNABLE:
@@ -773,26 +902,12 @@ class Bot:
             return {"ok": False, "error": f"unknown action {a}"}
         return {"ok": True}
 
-    def set_level(self, knob, level):
-        """Plain-English dashboard knobs, applied relative to the current round's preset."""
-        base = Config()
-        for k, v in ROUND_PRESETS.get(self.cfg.round, {}).items():
-            setattr(base, k, v)
-        if knob == "tenders":      # how much profit a tender needs before the bot takes it
-            self.cfg.min_edge = {"more": max(0.01, base.min_edge - 0.02), "normal": base.min_edge,
-                                 "picky": base.min_edge + 0.04}[level]
-        elif knob == "speed":      # how fast positions are closed
-            self.cfg.unwind_ticks = {"slow": base.unwind_ticks + 8, "normal": base.unwind_ticks,
-                                     "fast": max(8, base.unwind_ticks - 6)}[level]
-        elif knob == "auctions":   # how aggressively auctions are bid
-            d = {"win": -0.02, "normal": 0.0, "safe": 0.04}[level]
-            self.cfg.wta_extra_edge = max(0.0, base.wta_extra_edge + d)
-            self.cfg.comp_extra_edge = max(0.0, base.comp_extra_edge + d)
-        else:
-            return {"ok": False, "error": f"unknown control {knob}"}
-        self.easy_levels[knob] = level
-        log(f"[dash] {knob} -> {level}")
-        return {"ok": True}
+    def set_aggression(self, value):
+        self.cfg.aggression = int(max(0, min(100, float(value))))
+        for k, v in aggression_params(self.cfg.aggression, self.cfg.round).items():
+            setattr(self.cfg, k, v)
+        log(f"[dash] stance -> {stance_name(self.cfg.aggression)} ({self.cfg.aggression}/100): "
+            f"min edge {self.cfg.min_edge * 100:.1f}c, unwind {self.cfg.unwind_ticks} ticks")
 
     def apply_round(self, r: int):
         base = Config()
@@ -801,8 +916,8 @@ class Bot:
         for k, v in ROUND_PRESETS.get(r, {}).items():
             setattr(self.cfg, k, v)
         self.cfg.round = r
-        self.easy_levels = {"tenders": "normal", "speed": "normal", "auctions": "normal"}
         log(f"[dash] round {r} preset loaded")
+        self.set_aggression(self.cfg.aggression)
 
     def publish_state(self, case, nlv, connected):
         stocks = []
@@ -821,8 +936,9 @@ class Bot:
             "tpp": case.get("ticks_per_period", 300), "nlv": nlv, "nlv_hist": self.nlv_hist[-1500:],
             "stocks": stocks, "tenders": sorted(self.tender_view.values(), key=lambda v: v["id"]),
             "stats": self.stats, "round": self.cfg.round,
-            "config": {k: getattr(self.cfg, k) for k in TUNABLE}, "levels": self.easy_levels,
-            "log": list(LOG)[-150:], "error": self.last_error,
+            "config": {k: getattr(self.cfg, k) for k in TUNABLE}, "aggression": self.cfg.aggression,
+            "stance": stance_name(self.cfg.aggression), "scorecard": self.scorecard[-20:],
+            "log": list(LOG)[-150:], "error": self.last_error, "breaker": self.breaker,
         }
 
 
@@ -841,10 +957,12 @@ def parse_args() -> Config:
     for k, v in ROUND_PRESETS.get(args["round"], {}).items():
         if k not in given:
             args[k] = v
+    for k, v in aggression_params(args["aggression"], args["round"]).items():
+        if k not in given:
+            args[k] = v
     cfg = Config(**args)
-    if cfg.round:
-        print(f"Round {cfg.round} preset: " + ", ".join(f"{k}={getattr(cfg, k)}" for k in
-              ("no_fines", "min_edge", "risk_aversion", "unwind_ticks", "front_load")), flush=True)
+    print(f"Round {cfg.round or '-'} | stance {stance_name(cfg.aggression)} ({cfg.aggression}/100): "
+          + ", ".join(f"{k}={getattr(cfg, k)}" for k in ("no_fines", "min_edge", "unwind_ticks")), flush=True)
     return cfg
 
 
@@ -975,6 +1093,20 @@ button.on { outline: 2px solid var(--series-1); outline-offset: -2px; }
   border: 1px solid var(--border); border-radius: 6px; background: var(--surface-2); color: var(--text-primary); text-align: right; }
 .params input.saved { outline: 2px solid var(--good); }
 .hint { color: var(--text-muted); font-size: 12px; margin: 8px 0 0; }
+.stance { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.stance-name { font-size: 26px; font-weight: 750; }
+.stance-num { color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+.stance-num b { color: var(--text-primary); font-size: 18px; }
+#aggr { width: 100%; margin: 12px 0 2px; accent-color: var(--series-1); height: 22px; }
+.scale { display: flex; justify-content: space-between; color: var(--text-muted); font-size: 11px; }
+.quick { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; margin-top: 10px; }
+.quick button { padding: 6px 2px; font-size: 12px; }
+.plain { margin: 12px 0 0; padding-left: 18px; color: var(--text-secondary); font-size: 13px; }
+.plain li { margin: 3px 0; }
+.plain b { color: var(--text-primary); }
+.score-sum { margin-bottom: 8px; color: var(--text-secondary); }
+.score-sum b { color: var(--text-primary); }
+.advice { margin-top: 6px; padding: 8px 10px; border-radius: 6px; background: var(--surface-2); color: var(--text-primary); }
 .easy { display: flex; flex-direction: column; gap: 12px; }
 .easy .lbl { font-weight: 600; font-size: 13px; margin-bottom: 2px; }
 .easy .desc { color: var(--text-muted); font-size: 12px; margin-bottom: 6px; }
@@ -996,6 +1128,7 @@ button.on { outline: 2px solid var(--series-1); outline-offset: -2px; }
   <span class="pill" id="modePill"><span id="modeDot" class="dot"></span><span id="mode">-</span></span>
   <span class="pill" id="statePill"><span id="stateDot" class="dot"></span><span id="state">-</span></span>
   <span class="pill" id="roundPill">Round -</span>
+  <span class="pill" id="stancePill">Stance -</span>
   <span class="pill" id="tickPill">tick -</span>
   <div class="progress" aria-hidden="true"><div id="prog"></div></div>
   <button class="small" id="themeBtn" title="Toggle light/dark">Theme</button>
@@ -1013,6 +1146,11 @@ button.on { outline: 2px solid var(--series-1); outline-offset: -2px; }
       </div>
     </section>
     <section class="card">
+      <h2>Tender results this round</h2>
+      <div class="score-sum" id="scoreSum"></div>
+      <div class="scroll-x" id="score"></div>
+    </section>
+    <section class="card">
       <h2>Tenders &amp; auctions</h2>
       <div class="scroll-x" id="tenders"></div>
       <p class="hint">Net = expected profit per share after impact, fees and risk. The bot auto-accepts when net &ge; min edge (if auto-accept is on). Use the buttons to override.</p>
@@ -1023,6 +1161,17 @@ button.on { outline: 2px solid var(--series-1); outline-offset: -2px; }
     </section>
   </div>
   <div class="col">
+    <section class="card">
+      <h2>Stance</h2>
+      <div class="stance"><span class="stance-name" id="stanceName">-</span>
+        <span class="stance-num"><b id="stanceNum">-</b> / 100 aggression</span></div>
+      <input type="range" id="aggr" min="0" max="100" step="5" aria-label="Aggression from 0 (cautious) to 100 (max)">
+      <div class="scale"><span>Cautious</span><span>Balanced</span><span>Aggressive</span><span>Max</span></div>
+      <div class="quick" id="quick"></div>
+      <ul class="plain" id="plain"></ul>
+      <p class="hint">More aggressive = takes more tenders and sells faster: more profit on average, bigger swings.
+        Picking a round keeps your stance and adjusts it for that round.</p>
+    </section>
     <section class="card">
       <h2>Controls</h2>
       <div class="controls">
@@ -1037,9 +1186,8 @@ button.on { outline: 2px solid var(--series-1); outline-offset: -2px; }
       <div class="rounds" id="rounds"></div>
     </section>
     <section class="card">
-      <h2>Strategy</h2>
+      <h2>Extra strategies</h2>
       <div class="easy" id="easy"></div>
-      <p class="hint">Changes apply instantly. Picking a round resets everything to Normal for that round.</p>
       <details class="adv">
         <summary>Advanced settings</summary>
         <div class="params" id="params"></div>
@@ -1058,19 +1206,17 @@ const fmtN = (v, d = 2) => (v == null ? "-" : Number(v).toFixed(d));
 const signed = (v) => (v > 0 ? "+" : "") + Math.round(v).toLocaleString();
 let S = null;
 
+const STANCES = [["Cautious", 15], ["Balanced", 40], ["Aggressive", 70], ["Max", 95]];
+const stanceName = (a) => a < 25 ? "Cautious" : a < 55 ? "Balanced" : a < 80 ? "Aggressive" : "Max aggressive";
 const EASY = [
-  { knob: "tenders", label: "Tenders", desc: "How much profit a tender needs before the bot takes it.",
-    opts: [["more", "Take more"], ["normal", "Normal"], ["picky", "Picky"]] },
-  { knob: "speed", label: "Unwind speed", desc: "How fast the bot sells off a position after taking a tender.",
-    opts: [["slow", "Slow"], ["normal", "Normal"], ["fast", "Fast"]] },
-  { knob: "auctions", label: "Auctions (rounds 6 & 8)", desc: "Win more auctions, or bid safer for more profit per win.",
-    opts: [["win", "Win more"], ["normal", "Normal"], ["safe", "Safer"]] },
   { toggle: "crowd", label: "Crowd trade (rounds 6 & 8)", desc: "Trade ahead of other auction winners dumping their shares.",
     opts: [[true, "On"], [false, "Off"]] },
   { toggle: "arb", label: "Market arbitrage (rounds 5-6)", desc: "Buy on one market and sell on the other when prices cross.",
     opts: [[true, "On"], [false, "Off"]] },
 ];
 const PARAMS = [
+  ["loss_limit", "Loss limit $ (0 = off)", 10000],
+  ["max_position", "Max shares per stock", 10000],
   ["min_edge", "Min edge $/share", 0.005],
   ["risk_aversion", "Risk aversion", 0.1],
   ["impact_weight", "Impact weight", 0.1],
@@ -1105,14 +1251,20 @@ for (let r = 1; r <= 8; r++) {
   b.onclick = () => control({ action: "round", value: r });
   $("rounds").appendChild(b);
 }
+for (const [name, val] of STANCES) {
+  const b = document.createElement("button"); b.textContent = name; b.dataset.a = val;
+  b.onclick = () => control({ action: "aggression", value: val });
+  $("quick").appendChild(b);
+}
+$("aggr").oninput = () => { const a = +$("aggr").value; $("stanceNum").textContent = a; $("stanceName").textContent = stanceName(a); };
+$("aggr").onchange = () => control({ action: "aggression", value: +$("aggr").value });
 for (const e of EASY) {
   const wrap = document.createElement("div");
   wrap.innerHTML = `<div class="lbl">${e.label}</div><div class="desc">${e.desc}</div>`;
   const seg = document.createElement("div"); seg.className = "seg"; seg.id = "seg_" + (e.knob || e.toggle);
   for (const [val, text] of e.opts) {
     const b = document.createElement("button"); b.textContent = text; b.dataset.v = String(val);
-    b.onclick = () => e.knob ? control({ action: "level", knob: e.knob, value: val })
-      : e.toggle === "crowd" ? control({ action: "set", key: "crowd_size", value: val ? 25000 : 0 })
+    b.onclick = () => e.toggle === "crowd" ? control({ action: "set", key: "crowd_size", value: val ? 25000 : 0 })
       : control({ action: "set", key: "arb", value: val });
     seg.appendChild(b);
   }
@@ -1174,7 +1326,7 @@ function drawChart(s) {
   }
   for (let t = 0; t <= tpp; t += 50) g += `<text x="${x(t)}" y="${H - 6}" text-anchor="middle">${t}</text>`;
   if (pts.length > 1) {
-    const d = pts.map((p, i) => (i ? "L" : "M") + x(p[0]).toFixed(1) + "," + y(p[1]).toFixed(1)).join("");
+    const d = pts.map((p, i) => (i && p[0] >= pts[i - 1][0] ? "L" : "M") + x(p[0]).toFixed(1) + "," + y(p[1]).toFixed(1)).join("");
     g += `<path d="${d}" fill="none" stroke="var(--series-1)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
   } else {
     g += `<text x="${(L + W - R) / 2}" y="${H / 2}" text-anchor="middle">P&amp;L appears once the round is running</text>`;
@@ -1221,7 +1373,7 @@ function render(s) {
   $("tickPill").textContent = `period ${s.period ?? "-"} · tick ${s.tick ?? 0}/${s.tpp ?? 300}`;
   $("prog").style.width = ((s.tick || 0) / (s.tpp || 300) * 100).toFixed(1) + "%";
   const b = $("banner");
-  if (!s.connected && s.error) { b.style.display = "block"; b.textContent = s.error; } else b.style.display = "none";
+  if ((!s.connected || s.breaker) && s.error) { b.style.display = "block"; b.textContent = s.error; } else b.style.display = "none";
 
   $("nlv").textContent = fmt$(s.nlv || 0);
   const st2 = s.stats || {};
@@ -1236,8 +1388,46 @@ function render(s) {
   $("dryBtn").textContent = s.live ? "Mode: LIVE" : "Mode: DRY RUN";
   for (const btn of $("rounds").children) btn.classList.toggle("on", +btn.dataset.r === s.round);
   for (const e of EASY) {
-    const cur = e.knob ? (s.levels || {})[e.knob] : e.toggle === "crowd" ? String(s.config.crowd_size > 0) : String(!!s.config.arb);
-    for (const b of $("seg_" + (e.knob || e.toggle)).children) b.classList.toggle("on", b.dataset.v === cur);
+    const cur = e.toggle === "crowd" ? String(s.config.crowd_size > 0) : String(!!s.config.arb);
+    for (const b of $("seg_" + e.toggle).children) b.classList.toggle("on", b.dataset.v === cur);
+  }
+  // stance
+  $("stancePill").textContent = `${s.stance} · ${s.aggression}/100`;
+  if (document.activeElement !== $("aggr")) {
+    $("aggr").value = s.aggression; $("stanceNum").textContent = s.aggression; $("stanceName").textContent = s.stance;
+  }
+  for (const b of $("quick").children) b.classList.toggle("on", stanceName(+b.dataset.a) === s.stance);
+  const c = s.config;
+  $("plain").innerHTML = `<li>Takes a tender when it expects at least <b>${(c.min_edge * 100).toFixed(1)}¢ per share</b> profit after costs and a risk charge</li>
+    <li>Sells off each position in about <b>${c.unwind_ticks} ticks</b></li>
+    <li>Auctions: keeps a <b>${(c.wta_extra_edge * 100).toFixed(1)}¢</b> (winner-take-all) / <b>${(c.comp_extra_edge * 100).toFixed(1)}¢</b> (competitive) safety margin</li>
+    <li>Safety: never holds more than <b>${(c.max_position || 0).toLocaleString()} shares</b> of one stock; stops and closes everything if the round loss passes <b>${fmt$(c.loss_limit || 0)}</b></li>
+    <li>${c.no_fines ? "No-fines round: extra strategies below are active" : "Fines round: only trades to sell off tenders"}</li>`;
+
+  // tender results
+  const sc = s.scorecard || [], done = sc.filter(r => r.status === "done");
+  const expT = done.reduce((a, r) => a + r.expected, 0), actT = done.reduce((a, r) => a + r.actual, 0);
+  let advice = "Results show up once the bot has finished selling off a tender.";
+  if (done.length && expT > 0) {
+    const ratio = actT / expT;
+    advice = ratio >= 1.15 ? `Tenders are earning <b>${Math.round(ratio * 100)}%</b> of what the bot predicted: it is being too careful. Try moving the stance <b>up</b>.`
+      : ratio <= 0.7 ? `Tenders are earning only <b>${Math.round(ratio * 100)}%</b> of what the bot predicted. Try moving the stance <b>down</b>.`
+      : `Tenders are earning <b>${Math.round(ratio * 100)}%</b> of what the bot predicted: on track.`;
+  }
+  $("scoreSum").innerHTML = done.length
+    ? `Closed <b>${done.length}</b> tender${done.length > 1 ? "s" : ""}: expected <b>${fmt$(expT)}</b>, actual <b>${fmt$(actT)}</b><div class="advice">${advice}</div>`
+    : `<div class="advice">${advice}</div>`;
+  if (!sc.length) $("score").innerHTML = `<div class="empty">No tenders accepted yet this round.</div>`;
+  else {
+    let h = `<table><thead><tr><th>Tender</th><th>Side</th><th>Qty</th><th>Price</th><th>Expected</th><th>Actual</th><th>Status</th></tr></thead><tbody>`;
+    for (const r of sc.slice().reverse()) {
+      const cls = r.status === "done" ? "good" : r.status === "unwinding" ? "warning" : "";
+      const label = r.status === "done" ? "Closed" : r.status === "unwinding" ? "Selling off" : "Dry run";
+      h += `<tr><td>${r.id} <span class="mkt">${r.ticker}</span></td><td>${r.side}</td><td>${(r.qty || 0).toLocaleString()}</td><td>${fmtN(r.price)}</td>
+        <td>${fmt$(r.expected)}</td><td>${r.actual == null ? "-" : fmt$(r.actual)}${r.approx ? ' <span class="mkt">≈</span>' : ""}</td>
+        <td><span class="badge ${cls}">${label}</span></td></tr>`;
+    }
+    $("score").innerHTML = h + `</tbody></table><p class="hint">Actual = change in NLV from accepting until the position is closed. ≈ means another tender, auction or crowd trade overlapped, so they share the number.</p>`;
   }
   for (const [key, , step] of PARAMS) {
     const inp = $("p_" + key), v = s.config[key];

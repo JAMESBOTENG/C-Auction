@@ -226,7 +226,7 @@ class H(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     rebuild_books()
     threading.Thread(target=clock, daemon=True).start()
-    srv = ThreadingHTTPServer(("localhost", 9999), H)
+    srv = ThreadingHTTPServer(("localhost", int(sys.argv[3]) if len(sys.argv) > 3 else 9999), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     while S["tick"] < TPP:
         time.sleep(0.5)
