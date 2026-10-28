@@ -20,7 +20,8 @@ REST API enabled (in the RIT client: the "API" button / tab shows the port and t
 Usage:
     python rit_liability_bot.py --api-key YOURKEY
     python rit_liability_bot.py --api-key YOURKEY --dry-run          # watch decisions, trade nothing
-    python rit_liability_bot.py --api-key YOURKEY --min-edge 0.05    # pickier (later rounds)
+    python rit_liability_bot.py --api-key YOURKEY --round 3          # load that round's preset
+    python rit_liability_bot.py --api-key YOURKEY --round 7 --min-edge 0.04   # preset + override
 """
 from __future__ import annotations
 
@@ -66,6 +67,30 @@ class Config:
     endgame_ticks: int = 12           # with this few ticks left in the period, flatten everything
     net_across_markets: bool = True   # treat CRZY_M and CRZY_A as one inventory (see README)
     book_depth: int = 50
+    front_load: float = 1.0           # >1 unwinds faster early on (beat other traders to the book)
+
+    # --- rounds 5-8 (no fines): speculative edges, all off unless no_fines ------------------
+    round: int = 0                    # 1-8 applies the ROUND_PRESETS below
+    no_fines: bool = False
+    crowd_size: int = 25000           # competitive auctions: pre-position ahead of the winners' unwind
+    crowd_ticks: int = 6              # ...starting this many ticks before the auction closes
+    crowd_hold: int = 4               # ...and holding it this many ticks after it closes
+    arb: bool = True                  # cross-market arbitrage _M vs _A when prices cross after fees
+    arb_min: float = 0.005            # $/share profit after both fees
+    arb_max_qty: int = 5000
+
+
+# Explicit command-line flags always win over these.
+ROUND_PRESETS = {
+    1: {},
+    2: {},
+    3: {},
+    4: {"unwind_ticks": 15},
+    5: {"no_fines": True, "front_load": 1.3},
+    6: {"no_fines": True, "front_load": 1.5, "min_edge": 0.05},
+    7: {"no_fines": True, "front_load": 1.3, "min_edge": 0.05, "risk_aversion": 0.8},
+    8: {"no_fines": True, "front_load": 1.5, "min_edge": 0.05, "risk_aversion": 0.8},
+}
 
 
 # --------------------------------------------------------------------------------------------------
@@ -165,6 +190,10 @@ class Bot:
         self.tender_log = {}               # tender_id -> last decision text (avoid log spam)
         self.auction_done = set()
         self.accepted = set()
+        self.crowd_done = set()
+        self.crowd_pos = {}                # und -> signed shares of the crowd pre-position
+        self.hold_until = {}               # und -> tick until which unwind leaves the position alone
+        self.arb_tick = {}
 
     # ---------------------------------------------------------------- market data
     def snapshot(self, case):
@@ -254,12 +283,14 @@ class Bot:
         # sd of P&L while unwinding linearly over T ticks: |inv| * price * sigma * sqrt(T/3)
         return abs(inv) * mid * self.tick_vol(und) * math.sqrt(self.cfg.unwind_ticks / 3)
 
-    def tender_cost_per_share(self, und, signed_qty: int, impact_mult: float = 1.0):
+    def tender_cost_per_share(self, und, signed_qty: int, impact_mult: float = 1.0, exclude_crowd=False):
         """Returns (mid, required discount vs mid per share) for adding signed_qty to inventory."""
         mid = self.mid(und)
         if not mid:
             return None, None
         pos = self.position(und)
+        if exclude_crowd:  # the crowd pre-position is a separate bet, not a hedge for the auction block
+            pos -= self.crowd_pos.get(und, 0)
         new = pos + signed_qty
         d_cost = self.liquidation_cost(und, new, mid) - self.liquidation_cost(und, pos, mid)
         d_risk = self.inventory_risk(und, new, mid) - self.inventory_risk(und, pos, mid)
@@ -321,15 +352,19 @@ class Bot:
                     # keep watching: the market may move in our favour before it expires
                     self.log_tender(tid, tag + "  pass (watching until expiry)")
             else:
+                wta = "winner" in caption or "highest" in caption or "lowest" in caption
+                if (self.cfg.no_fines and not wta and self.cfg.crowd_size and tid not in self.crowd_done
+                        and expires - tick <= self.cfg.crowd_ticks):
+                    self.crowd_trade(und, we_buy, expires, tick)
+                    self.crowd_done.add(tid)
                 if tid in self.auction_done or expires - tick > self.cfg.auction_submit_before:
                     if tid not in self.auction_done:
                         self.log_tender(tid, f"AUCTION {tid} {t['action']} {q:,} {ticker} "
                                              f"- will bid at t{expires - self.cfg.auction_submit_before}")
                     continue
-                wta = "winner" in caption or "highest" in caption or "lowest" in caption
                 mult = 1.0 if wta else self.cfg.comp_impact_mult
                 extra = self.cfg.wta_extra_edge if wta else self.cfg.comp_extra_edge
-                mid, need = self.tender_cost_per_share(und, signed, mult)
+                mid, need = self.tender_cost_per_share(und, signed, mult, exclude_crowd=True)
                 if mid is None:
                     continue
                 disc = need + self.cfg.min_edge + extra
@@ -347,6 +382,46 @@ class Bot:
                             print("  auction submit failed:", e, flush=True)
                 self.auction_done.add(tid)
 
+    def crowd_trade(self, und, crowd_buys, expires, tick):
+        """Competitive auction: every winner will dump the block right after it closes. Get there first:
+        if the crowd is buying the block (and will sell it), go short now and cover into their selling."""
+        side = "SELL" if crowd_buys else "BUY"
+        signed = -self.cfg.crowd_size if crowd_buys else self.cfg.crowd_size
+        if not self.within_limits(signed):
+            return
+        lv = self.levels(und, side)
+        if not lv:
+            return
+        limit_net = lv[0].net - self.cfg.max_slippage if side == "SELL" else lv[0].net + self.cfg.max_slippage
+        _, filled, per_ticker = walk(lv, self.cfg.crowd_size, side, limit_net)
+        print(f"[t{tick}] CROWD {side} {filled:,} {und} ahead of auction unwind (hold to t{expires + self.cfg.crowd_hold})",
+              flush=True)
+        for t, (q, worst_raw) in per_ticker.items():
+            self.send(t, side, q, worst_raw)
+        self.hold_until[und] = expires + self.cfg.crowd_hold
+        self.crowd_pos[und] = filled if side == "BUY" else -filled
+
+    def arbitrage(self, tick):
+        if not (self.cfg.no_fines and self.cfg.arb and self.cfg.net_across_markets):
+            return
+        for und, tks in self.und_tickers.items():
+            if len(tks) < 2 or self.arb_tick.get(und) == tick:
+                continue
+            for a in tks:
+                for b in tks:
+                    sa, sb = self.secs[a], self.secs[b]
+                    ask, bid = sa.get("ask"), sb.get("bid")
+                    if a == b or not ask or not bid:
+                        continue
+                    if bid - ask - take_fee(sa) - take_fee(sb) >= self.cfg.arb_min:
+                        q = min(int(sa.get("ask_size") or 0), int(sb.get("bid_size") or 0), self.cfg.arb_max_qty)
+                        if q <= 0:
+                            continue
+                        print(f"[t{tick}] ARB buy {q:,} {a} @ {ask:.2f} / sell {b} @ {bid:.2f}", flush=True)
+                        self.send(a, "BUY", q, ask)
+                        self.send(b, "SELL", q, bid)
+                        self.arb_tick[und] = tick
+
     # ---------------------------------------------------------------- unwinding
     def unwind(self, case):
         tick, tpp = case["tick"], case["ticks_per_period"]
@@ -357,6 +432,8 @@ class Bot:
                 self.acquired_tick.pop(und, None)
                 continue
             self.acquired_tick.setdefault(und, tick)
+            if tick <= self.hold_until.get(und, -1) and ticks_left > self.cfg.endgame_ticks:
+                continue
             if self.slices[(und, tick)] >= self.cfg.orders_per_tick and ticks_left > self.cfg.endgame_ticks:
                 continue
 
@@ -364,7 +441,7 @@ class Bot:
             held = tick - self.acquired_tick[und]
             endgame = ticks_left <= self.cfg.endgame_ticks
             sched_left = max(1, self.cfg.unwind_ticks - held)
-            per_tick = remaining if endgame else math.ceil(remaining / sched_left)
+            per_tick = remaining if endgame else math.ceil(remaining / sched_left * self.cfg.front_load)
             qty = min(remaining, math.ceil(per_tick / self.cfg.orders_per_tick))
             if held > self.cfg.unwind_ticks:  # behind schedule -> speed up
                 qty = min(remaining, qty * 2)
@@ -423,6 +500,7 @@ class Bot:
                 self.handle_tenders(tick)
                 self.snapshot(case)                # refresh positions after any accepted tender
                 self.unwind(case)
+                self.arbitrage(tick)
                 if tick != last_status_tick and tick % 10 == 0:
                     last_status_tick = tick
                     nlv = self.api.get("/trader").get("nlv", 0)
@@ -446,7 +524,16 @@ def parse_args() -> Config:
                             dest=name, help=f"(default {default})")
         else:
             ap.add_argument(flag, type=type(default), default=default, dest=name, help=f"(default {default})")
-    return Config(**vars(ap.parse_args()))
+    args = vars(ap.parse_args())
+    given = {a.lstrip("-").split("=")[0].replace("-", "_") for a in sys.argv[1:] if a.startswith("--")}
+    for k, v in ROUND_PRESETS.get(args["round"], {}).items():
+        if k not in given:
+            args[k] = v
+    cfg = Config(**args)
+    if cfg.round:
+        print(f"Round {cfg.round} preset: " + ", ".join(f"{k}={getattr(cfg, k)}" for k in
+              ("no_fines", "min_edge", "risk_aversion", "unwind_ticks", "front_load")), flush=True)
+    return cfg
 
 
 if __name__ == "__main__":

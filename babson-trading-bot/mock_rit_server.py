@@ -35,7 +35,10 @@ def und(t):
 def rebuild_books():
     for t in TICKERS:
         u = und(t)
-        mid = S["true"][u] + S["pressure"][u] + random.uniform(-0.02, 0.02) * (1 if t.endswith("_A") else 0)
+        alt = t.endswith("_A")
+        mid = S["true"][u] + S["pressure"][u] + (random.uniform(-0.02, 0.02) if alt else 0)
+        if alt and random.random() < 0.05:  # occasional cross-market dislocation
+            mid += random.choice([-0.05, 0.05])
         mid = round(mid, 2)
         S["books"][t] = {
             "bids": [{"price": round(mid - 0.01 * k, 2), "quantity": random.randint(2, 6) * 1000,
@@ -92,7 +95,10 @@ def clock():
                                     "quantity": 50000, "action": "BUY", "is_fixed_bid": False, "price": None,
                                     "ticker": u + "_M", "reserve": round(S["true"][u] - 0.30, 2)}
             for tid in [k for k, v in S["tenders"].items() if v["expires"] < tk]:
-                del S["tenders"][tid]
+                t = S["tenders"].pop(tid)
+                if t["is_fixed_bid"] is False and "reserve" in t["caption"]:
+                    # other winners of a competitive auction all dump at once
+                    S["pressure"][und(t["ticker"])] += -0.25 if t["action"] == "BUY" else 0.25
 
 
 def nlv():
@@ -130,6 +136,7 @@ class H(BaseHTTPRequestHandler):
                     b = S["books"].get(t) or {"bids": [{"price": 0}], "asks": [{"price": 0}]}
                     out.append({"ticker": t, "type": "STOCK", "position": S["pos"][t], "is_tradeable": True,
                                 "bid": b["bids"][0]["price"], "ask": b["asks"][0]["price"],
+                                "bid_size": b["bids"][0].get("quantity", 0), "ask_size": b["asks"][0].get("quantity", 0),
                                 "last": S["true"][und(t)], "trading_fee": FEE[t[-2:]],
                                 "limit_order_rebate": 0.005 if t.endswith("_A") else 0, "max_trade_size": 10000})
                 return self.reply(out)
@@ -148,7 +155,9 @@ class H(BaseHTTPRequestHandler):
                 return self.reply([{k: v for k, v in t.items() if k != "reserve"} for t in S["tenders"].values()])
             if p.startswith("/v1/tenders/"):
                 tid = int(p.rsplit("/", 1)[1])
-                t = S["tenders"].pop(tid, None)
+                t = S["tenders"].get(tid)
+                if t and t["is_fixed_bid"] or method == "DELETE":
+                    S["tenders"].pop(tid, None)
                 if t and method == "POST":
                     price = float(q["price"]) if "price" in q else t["price"]
                     if t["is_fixed_bid"] or price >= t["reserve"]:
