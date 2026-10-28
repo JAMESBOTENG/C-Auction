@@ -33,6 +33,7 @@ import signal
 import sys
 import threading
 import time
+import traceback
 import webbrowser
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -217,6 +218,7 @@ class Bot:
         self.commands = queue.Queue()
         self.state = {"connected": False, "log": []}
         self.last_error = ""
+        self.easy_levels = {"tenders": "normal", "speed": "normal", "auctions": "normal"}
         self.reset_period_state()
 
     def reset_period_state(self):
@@ -690,6 +692,10 @@ class Bot:
             except RuntimeError as e:
                 self.last_error = f"API error: {e}"
                 log(self.last_error)
+            except Exception as e:  # never die mid-round: log it and keep trading
+                self.last_error = f"Unexpected error: {e!r}"
+                log(self.last_error)
+                traceback.print_exc()
             time.sleep(self.cfg.loop_sleep)
 
     # ---------------------------------------------------------------- dashboard plumbing
@@ -750,6 +756,8 @@ class Bot:
             log(f"[dash] mode -> {'DRY RUN' if self.cfg.dry_run else 'LIVE'}")
         elif a == "round":
             self.apply_round(int(cmd["value"]))
+        elif a == "level":
+            return self.set_level(cmd.get("knob"), cmd.get("value"))
         elif a == "set":
             key = cmd.get("key")
             if key not in TUNABLE:
@@ -765,13 +773,35 @@ class Bot:
             return {"ok": False, "error": f"unknown action {a}"}
         return {"ok": True}
 
+    def set_level(self, knob, level):
+        """Plain-English dashboard knobs, applied relative to the current round's preset."""
+        base = Config()
+        for k, v in ROUND_PRESETS.get(self.cfg.round, {}).items():
+            setattr(base, k, v)
+        if knob == "tenders":      # how much profit a tender needs before the bot takes it
+            self.cfg.min_edge = {"more": max(0.01, base.min_edge - 0.02), "normal": base.min_edge,
+                                 "picky": base.min_edge + 0.04}[level]
+        elif knob == "speed":      # how fast positions are closed
+            self.cfg.unwind_ticks = {"slow": base.unwind_ticks + 8, "normal": base.unwind_ticks,
+                                     "fast": max(8, base.unwind_ticks - 6)}[level]
+        elif knob == "auctions":   # how aggressively auctions are bid
+            d = {"win": -0.02, "normal": 0.0, "safe": 0.04}[level]
+            self.cfg.wta_extra_edge = max(0.0, base.wta_extra_edge + d)
+            self.cfg.comp_extra_edge = max(0.0, base.comp_extra_edge + d)
+        else:
+            return {"ok": False, "error": f"unknown control {knob}"}
+        self.easy_levels[knob] = level
+        log(f"[dash] {knob} -> {level}")
+        return {"ok": True}
+
     def apply_round(self, r: int):
         base = Config()
-        for k in set().union(*ROUND_PRESETS.values()):
+        for k in set(TUNABLE).union(*ROUND_PRESETS.values()):
             setattr(self.cfg, k, getattr(base, k))
         for k, v in ROUND_PRESETS.get(r, {}).items():
             setattr(self.cfg, k, v)
         self.cfg.round = r
+        self.easy_levels = {"tenders": "normal", "speed": "normal", "auctions": "normal"}
         log(f"[dash] round {r} preset loaded")
 
     def publish_state(self, case, nlv, connected):
@@ -791,7 +821,7 @@ class Bot:
             "tpp": case.get("ticks_per_period", 300), "nlv": nlv, "nlv_hist": self.nlv_hist[-1500:],
             "stocks": stocks, "tenders": sorted(self.tender_view.values(), key=lambda v: v["id"]),
             "stats": self.stats, "round": self.cfg.round,
-            "config": {k: getattr(self.cfg, k) for k in TUNABLE},
+            "config": {k: getattr(self.cfg, k) for k in TUNABLE}, "levels": self.easy_levels,
             "log": list(LOG)[-150:], "error": self.last_error,
         }
 
@@ -945,6 +975,13 @@ button.on { outline: 2px solid var(--series-1); outline-offset: -2px; }
   border: 1px solid var(--border); border-radius: 6px; background: var(--surface-2); color: var(--text-primary); text-align: right; }
 .params input.saved { outline: 2px solid var(--good); }
 .hint { color: var(--text-muted); font-size: 12px; margin: 8px 0 0; }
+.easy { display: flex; flex-direction: column; gap: 12px; }
+.easy .lbl { font-weight: 600; font-size: 13px; margin-bottom: 2px; }
+.easy .desc { color: var(--text-muted); font-size: 12px; margin-bottom: 6px; }
+.seg { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 4px; }
+.seg button { padding: 7px 4px; font-size: 13px; }
+.adv { margin-top: 14px; border-top: 1px solid var(--border); padding-top: 10px; }
+.adv summary { cursor: pointer; color: var(--text-secondary); font-size: 13px; font-weight: 600; margin-bottom: 10px; }
 #log { font: 12px/1.5 var(--mono); height: 340px; overflow: auto; background: var(--surface-2); border-radius: 6px;
   padding: 8px; white-space: pre-wrap; word-break: break-word; color: var(--text-secondary); }
 .banner { display: none; background: var(--surface-1); border: 1px solid var(--critical); color: var(--text-primary);
@@ -1000,9 +1037,13 @@ button.on { outline: 2px solid var(--series-1); outline-offset: -2px; }
       <div class="rounds" id="rounds"></div>
     </section>
     <section class="card">
-      <h2>Strategy settings</h2>
-      <div class="params" id="params"></div>
-      <p class="hint">Changes apply instantly. Picking a round preset resets these to that round's values.</p>
+      <h2>Strategy</h2>
+      <div class="easy" id="easy"></div>
+      <p class="hint">Changes apply instantly. Picking a round resets everything to Normal for that round.</p>
+      <details class="adv">
+        <summary>Advanced settings</summary>
+        <div class="params" id="params"></div>
+      </details>
     </section>
     <section class="card">
       <h2>Bot log</h2>
@@ -1017,6 +1058,18 @@ const fmtN = (v, d = 2) => (v == null ? "-" : Number(v).toFixed(d));
 const signed = (v) => (v > 0 ? "+" : "") + Math.round(v).toLocaleString();
 let S = null;
 
+const EASY = [
+  { knob: "tenders", label: "Tenders", desc: "How much profit a tender needs before the bot takes it.",
+    opts: [["more", "Take more"], ["normal", "Normal"], ["picky", "Picky"]] },
+  { knob: "speed", label: "Unwind speed", desc: "How fast the bot sells off a position after taking a tender.",
+    opts: [["slow", "Slow"], ["normal", "Normal"], ["fast", "Fast"]] },
+  { knob: "auctions", label: "Auctions (rounds 6 & 8)", desc: "Win more auctions, or bid safer for more profit per win.",
+    opts: [["win", "Win more"], ["normal", "Normal"], ["safe", "Safer"]] },
+  { toggle: "crowd", label: "Crowd trade (rounds 6 & 8)", desc: "Trade ahead of other auction winners dumping their shares.",
+    opts: [[true, "On"], [false, "Off"]] },
+  { toggle: "arb", label: "Market arbitrage (rounds 5-6)", desc: "Buy on one market and sell on the other when prices cross.",
+    opts: [[true, "On"], [false, "Off"]] },
+];
 const PARAMS = [
   ["min_edge", "Min edge $/share", 0.005],
   ["risk_aversion", "Risk aversion", 0.1],
@@ -1051,6 +1104,19 @@ for (let r = 1; r <= 8; r++) {
   b.textContent = r; b.dataset.r = r;
   b.onclick = () => control({ action: "round", value: r });
   $("rounds").appendChild(b);
+}
+for (const e of EASY) {
+  const wrap = document.createElement("div");
+  wrap.innerHTML = `<div class="lbl">${e.label}</div><div class="desc">${e.desc}</div>`;
+  const seg = document.createElement("div"); seg.className = "seg"; seg.id = "seg_" + (e.knob || e.toggle);
+  for (const [val, text] of e.opts) {
+    const b = document.createElement("button"); b.textContent = text; b.dataset.v = String(val);
+    b.onclick = () => e.knob ? control({ action: "level", knob: e.knob, value: val })
+      : e.toggle === "crowd" ? control({ action: "set", key: "crowd_size", value: val ? 25000 : 0 })
+      : control({ action: "set", key: "arb", value: val });
+    seg.appendChild(b);
+  }
+  wrap.appendChild(seg); $("easy").appendChild(wrap);
 }
 for (const [key, label, step] of PARAMS) {
   const l = document.createElement("label"); l.htmlFor = "p_" + key; l.textContent = label;
@@ -1169,6 +1235,10 @@ function render(s) {
   $("autoBtn").classList.toggle("on", !s.auto_tenders);
   $("dryBtn").textContent = s.live ? "Mode: LIVE" : "Mode: DRY RUN";
   for (const btn of $("rounds").children) btn.classList.toggle("on", +btn.dataset.r === s.round);
+  for (const e of EASY) {
+    const cur = e.knob ? (s.levels || {})[e.knob] : e.toggle === "crowd" ? String(s.config.crowd_size > 0) : String(!!s.config.arb);
+    for (const b of $("seg_" + (e.knob || e.toggle)).children) b.classList.toggle("on", b.dataset.v === cur);
+  }
   for (const [key, , step] of PARAMS) {
     const inp = $("p_" + key), v = s.config[key];
     if (document.activeElement === inp) continue;

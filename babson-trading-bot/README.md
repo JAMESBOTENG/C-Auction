@@ -21,12 +21,18 @@ When the bot starts, it opens **http://localhost:8050** in your browser. The pag
   - **Cancel orders**.
   - **LIVE / DRY RUN** switch.
   - **Round preset 1-8**.
-  - **Strategy settings**, which apply instantly.
+  - **Strategy:** simple choices, applied instantly relative to the round preset:
+    - **Tenders:** Take more / Normal / Picky.
+    - **Unwind speed:** Slow / Normal / Fast.
+    - **Auctions:** Win more / Normal / Safer.
+    - **Crowd trade** and **market arbitrage** on/off.
+
+    The technical numbers are under a collapsed **Advanced settings** section.
 - **Bot log**.
 
 `--dash-port 0` turns the dashboard off. `--no-browser` stops it opening automatically.
 
- on the practice server: are the two markets netted?
+## Check this first on the practice server: are the two markets netted?
 The bot treats `CRZY_M` and `CRZY_A` as **one inventory**. It may buy a tender on `_M` and sell part of it
 on `_A` when `_A` is cheaper, which can leave e.g. `CRZY_M +30,000 / CRZY_A -30,000`.
 On the practice server, accept a tender, let the bot unwind, then look at the Portfolio and
